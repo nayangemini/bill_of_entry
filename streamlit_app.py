@@ -130,102 +130,283 @@ def _get_store():
 
 
 # ---------------------------------------------------------------------------
-# Sidebar: manage stored data (Neon)
+# Stored-data manager (Neon): view / add / edit / delete + bulk upload
 # ---------------------------------------------------------------------------
+_ADDR_SEP = " | "
+
+
+def _addr_to_cell(lines) -> str:
+    """Join address lines into one grid cell (``line 1 | line 2 | ...``)."""
+    return _ADDR_SEP.join(lines or [])
+
+
+def _cell_to_addr(cell) -> list[str]:
+    """Split an address cell back into lines (on ``|`` or newlines)."""
+    if not cell:
+        return []
+    import re
+
+    return [p.strip() for p in re.split(r"\s*\|\s*|\r?\n", str(cell)) if p.strip()]
+
+
+def _read_uploaded_table(file):
+    """Read an uploaded CSV/XLSX into a list[dict] with lower-cased columns."""
+    import pandas as pd
+
+    if file.name.lower().endswith(".csv"):
+        df = pd.read_csv(file, dtype=str)
+    else:
+        df = pd.read_excel(file, dtype=str)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    return df.fillna("").to_dict("records")
+
+
+def _csv_bytes(rows: list[dict], columns: list[str]) -> bytes:
+    """Serialise rows to CSV bytes with a fixed column order."""
+    import csv
+    import io as _io
+
+    buf = _io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=columns)
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({c: r.get(c, "") for c in columns})
+    return buf.getvalue().encode("utf-8")
+
+
+def _first(row: dict, *keys: str) -> str:
+    """First non-empty value among ``keys`` in a (lower-cased) upload row."""
+    for k in keys:
+        v = row.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
 def _render_data_manager() -> None:
+    """Main-area manager: view/add/edit/delete + bulk upload for stored data."""
     from boe_converter.tally_store import BuyerRecord, SellerRecord, StoreError
 
-    st.sidebar.header("📇 Stored data (Neon)")
     store = _get_store()
-    if store is None:
-        st.sidebar.warning("Database not connected.")
+    with st.expander("📇 Manage stored data (Neon)", expanded=False):
+        if store is None:
+            st.warning("Database not connected — stored-data features are disabled.")
+            return
+        st.success("Database connected.")
+        tab_stock, tab_buyers, tab_sellers = st.tabs(
+            ["Stock names", "Buyers", "Sellers"]
+        )
+        with tab_stock:
+            _manage_stock(store, StoreError)
+        with tab_buyers:
+            _manage_buyers(store, BuyerRecord, StoreError)
+        with tab_sellers:
+            _manage_sellers(store, SellerRecord, StoreError)
+
+
+def _manage_stock(store, StoreError) -> None:
+    st.caption("Canonical Tally stock-item names offered in Step 2's dropdown.")
+    try:
+        current = store.list_stock_items()
+    except StoreError as exc:
+        st.error(str(exc))
         return
-    st.sidebar.success("Database connected.")
 
-    # --- Stock item names ---
-    with st.sidebar.expander("Stock item names", expanded=False):
-        try:
-            names = store.list_stock_items()
-        except StoreError as exc:
-            st.error(str(exc))
-            names = []
-        new_name = st.text_input("Add a stock name", key="add_stock")
-        if st.button("Add name", key="btn_add_stock"):
-            if new_name.strip() and store.add_stock_item(new_name):
-                st.success(f"Added “{new_name.strip()}”.")
-                st.rerun()
-            else:
-                st.info("Empty or already present.")
-        if names:
-            to_del = st.selectbox("Delete a name", ["—", *names], key="del_stock")
-            if st.button("Delete name", key="btn_del_stock") and to_del != "—":
-                store.delete_stock_item(to_del)
-                st.rerun()
-        st.caption(f"{len(names)} stored name(s).")
+    edited = st.data_editor(
+        [{"name": n} for n in current],
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="stock_grid",
+        column_config={"name": st.column_config.TextColumn("Stock name", required=True)},
+    )
+    c1, c2 = st.columns([1, 2])
+    if c1.button("💾 Save changes", key="save_stock"):
+        new_names = [str(r.get("name", "")).strip() for r in edited]
+        new_names = [n for n in new_names if n]
+        new_lower = {n.lower() for n in new_names}
+        old_lower = {n.lower() for n in current}
+        for n in current:  # deletions
+            if n.lower() not in new_lower:
+                store.delete_stock_item(n)
+        added = store.add_stock_items([n for n in new_names if n.lower() not in old_lower])
+        st.success(f"Saved. {added} added, {len(old_lower - new_lower)} deleted.")
+        st.rerun()
+    c2.download_button(
+        "⬇ Export CSV",
+        data=_csv_bytes([{"name": n} for n in current], ["name"]),
+        file_name="stock_names.csv",
+        mime="text/csv",
+        key="dl_stock",
+    )
 
-    # --- Buyers ---
-    with st.sidebar.expander("Buyer records", expanded=False):
-        try:
-            buyers = store.list_buyers()
-        except StoreError as exc:
-            st.error(str(exc))
-            buyers = []
-        with st.form("add_buyer_form", clear_on_submit=True):
-            b_name = st.text_input("Buyer name")
-            b_gstin = st.text_input("GSTIN")
-            b_state = st.text_input("State")
-            b_pin = st.text_input("Pincode")
-            b_addr = st.text_area("Address (one line per row)")
-            if st.form_submit_button("Save buyer"):
-                if b_name.strip():
-                    store.add_buyer(
-                        BuyerRecord(
-                            name=b_name.strip(),
-                            gstin=b_gstin.strip(),
-                            state=b_state.strip(),
-                            pincode=b_pin.strip(),
-                            address_lines=[l for l in b_addr.splitlines() if l.strip()],
-                        )
-                    )
-                    st.success("Buyer saved.")
-                    st.rerun()
-        if buyers:
-            names_b = [b.name for b in buyers]
-            to_del_b = st.selectbox("Delete a buyer", ["—", *names_b], key="del_buyer")
-            if st.button("Delete buyer", key="btn_del_buyer") and to_del_b != "—":
-                store.delete_buyer(to_del_b)
-                st.rerun()
-        st.caption(f"{len(buyers)} stored buyer(s).")
+    st.markdown("**Bulk upload** — CSV/Excel with a `name` column (or one name per row).")
+    up = st.file_uploader("Upload stock names", type=["csv", "xlsx"], key="bulk_stock")
+    if up is not None and st.button("Import stock names", key="imp_stock"):
+        rows = _read_uploaded_table(up)
+        names = [_first(r, "name", "stock name", "stockitemname") for r in rows]
+        names = [n for n in names if n]
+        added = store.add_stock_items(names)
+        st.success(f"Imported {added} new name(s) ({len(names) - added} already present).")
+        st.rerun()
 
-    # --- Sellers ---
-    with st.sidebar.expander("Seller records", expanded=False):
-        try:
-            sellers = store.list_sellers()
-        except StoreError as exc:
-            st.error(str(exc))
-            sellers = []
-        with st.form("add_seller_form", clear_on_submit=True):
-            s_name = st.text_input("Seller name")
-            s_country = st.text_input("Country")
-            s_addr = st.text_area("Address (one line per row)")
-            if st.form_submit_button("Save seller"):
-                if s_name.strip():
-                    store.add_seller(
-                        SellerRecord(
-                            name=s_name.strip(),
-                            country=s_country.strip(),
-                            address_lines=[l for l in s_addr.splitlines() if l.strip()],
-                        )
-                    )
-                    st.success("Seller saved.")
-                    st.rerun()
-        if sellers:
-            names_s = [s.name for s in sellers]
-            to_del_s = st.selectbox("Delete a seller", ["—", *names_s], key="del_seller")
-            if st.button("Delete seller", key="btn_del_seller") and to_del_s != "—":
-                store.delete_seller(to_del_s)
-                st.rerun()
-        st.caption(f"{len(sellers)} stored seller(s).")
+
+def _manage_buyers(store, BuyerRecord, StoreError) -> None:
+    st.caption("Buyer (importer) records used to override the BOE in Step 3.")
+    try:
+        buyers = store.list_buyers()
+    except StoreError as exc:
+        st.error(str(exc))
+        return
+
+    rows = [
+        {
+            "name": b.name,
+            "gstin": b.gstin,
+            "state": b.state,
+            "pincode": b.pincode,
+            "address": _addr_to_cell(b.address_lines),
+        }
+        for b in buyers
+    ]
+    edited = st.data_editor(
+        rows,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="buyers_grid",
+        column_config={
+            "name": st.column_config.TextColumn("Name", required=True),
+            "address": st.column_config.TextColumn("Address (lines split by |)"),
+        },
+    )
+    c1, c2 = st.columns([1, 2])
+    if c1.button("💾 Save changes", key="save_buyers"):
+        kept = set()
+        for r in edited:
+            name = str(r.get("name", "")).strip()
+            if not name:
+                continue
+            kept.add(name.lower())
+            store.add_buyer(
+                BuyerRecord(
+                    name=name,
+                    gstin=str(r.get("gstin", "")).strip(),
+                    state=str(r.get("state", "")).strip(),
+                    pincode=str(r.get("pincode", "")).strip(),
+                    address_lines=_cell_to_addr(r.get("address", "")),
+                )
+            )
+        for b in buyers:  # deletions (rows removed in the grid)
+            if b.name.lower() not in kept:
+                store.delete_buyer(b.name)
+        st.success("Buyers saved.")
+        st.rerun()
+    c2.download_button(
+        "⬇ Export CSV",
+        data=_csv_bytes(rows, ["name", "gstin", "state", "pincode", "address"]),
+        file_name="buyers.csv",
+        mime="text/csv",
+        key="dl_buyers",
+    )
+
+    st.markdown(
+        "**Bulk upload** — CSV/Excel columns: `name, gstin, state, pincode, address` "
+        "(address lines separated by `|`)."
+    )
+    up = st.file_uploader("Upload buyers", type=["csv", "xlsx"], key="bulk_buyers")
+    if up is not None and st.button("Import buyers", key="imp_buyers"):
+        recs = []
+        for r in _read_uploaded_table(up):
+            name = _first(r, "name", "buyer", "buyer name")
+            if not name:
+                continue
+            recs.append(
+                BuyerRecord(
+                    name=name,
+                    gstin=_first(r, "gstin"),
+                    state=_first(r, "state"),
+                    pincode=_first(r, "pincode", "pin"),
+                    address_lines=_cell_to_addr(_first(r, "address", "address_lines")),
+                )
+            )
+        saved = store.add_buyers(recs)
+        st.success(f"Imported/updated {saved} buyer(s).")
+        st.rerun()
+
+
+def _manage_sellers(store, SellerRecord, StoreError) -> None:
+    st.caption("Seller (supplier) records used to override the BOE in Step 3.")
+    try:
+        sellers = store.list_sellers()
+    except StoreError as exc:
+        st.error(str(exc))
+        return
+
+    rows = [
+        {"name": s.name, "country": s.country, "address": _addr_to_cell(s.address_lines)}
+        for s in sellers
+    ]
+    edited = st.data_editor(
+        rows,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="sellers_grid",
+        column_config={
+            "name": st.column_config.TextColumn("Name", required=True),
+            "address": st.column_config.TextColumn("Address (lines split by |)"),
+        },
+    )
+    c1, c2 = st.columns([1, 2])
+    if c1.button("💾 Save changes", key="save_sellers"):
+        kept = set()
+        for r in edited:
+            name = str(r.get("name", "")).strip()
+            if not name:
+                continue
+            kept.add(name.lower())
+            store.add_seller(
+                SellerRecord(
+                    name=name,
+                    country=str(r.get("country", "")).strip(),
+                    address_lines=_cell_to_addr(r.get("address", "")),
+                )
+            )
+        for s in sellers:
+            if s.name.lower() not in kept:
+                store.delete_seller(s.name)
+        st.success("Sellers saved.")
+        st.rerun()
+    c2.download_button(
+        "⬇ Export CSV",
+        data=_csv_bytes(rows, ["name", "country", "address"]),
+        file_name="sellers.csv",
+        mime="text/csv",
+        key="dl_sellers",
+    )
+
+    st.markdown(
+        "**Bulk upload** — CSV/Excel columns: `name, country, address` "
+        "(address lines separated by `|`)."
+    )
+    up = st.file_uploader("Upload sellers", type=["csv", "xlsx"], key="bulk_sellers")
+    if up is not None and st.button("Import sellers", key="imp_sellers"):
+        recs = []
+        for r in _read_uploaded_table(up):
+            name = _first(r, "name", "seller", "supplier", "seller name")
+            if not name:
+                continue
+            recs.append(
+                SellerRecord(
+                    name=name,
+                    country=_first(r, "country"),
+                    address_lines=_cell_to_addr(_first(r, "address", "address_lines")),
+                )
+            )
+        saved = store.add_sellers(recs)
+        st.success(f"Imported/updated {saved} seller(s).")
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------

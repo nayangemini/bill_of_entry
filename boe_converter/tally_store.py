@@ -182,6 +182,14 @@ class TallyStore:
         )
         return n > 0
 
+    def add_stock_items(self, names) -> int:
+        """Bulk-add stock names (case-insensitive de-dup). Returns count added."""
+        added = 0
+        for name in names:
+            if isinstance(name, str) and self.add_stock_item(name):
+                added += 1
+        return added
+
     def delete_stock_item(self, name: str) -> bool:
         n = self._exec_returning(
             "DELETE FROM stock_items WHERE lower(name) = lower(%s)", (name.strip(),)
@@ -215,6 +223,14 @@ class TallyStore:
         )
         return True
 
+    def add_buyers(self, buyers) -> int:
+        """Bulk add/replace buyer records (keyed by name). Returns count saved."""
+        saved = 0
+        for b in buyers:
+            if self.add_buyer(b):
+                saved += 1
+        return saved
+
     def delete_buyer(self, name: str) -> bool:
         n = self._exec_returning(
             "DELETE FROM buyers WHERE lower(name) = lower(%s)", (name.strip(),)
@@ -247,6 +263,14 @@ class TallyStore:
             (seller.name.strip(), seller.country, json.dumps(seller.address_lines)),
         )
         return True
+
+    def add_sellers(self, sellers) -> int:
+        """Bulk add/replace seller records (keyed by name). Returns count saved."""
+        saved = 0
+        for s in sellers:
+            if self.add_seller(s):
+                saved += 1
+        return saved
 
     def delete_seller(self, name: str) -> bool:
         n = self._exec_returning(

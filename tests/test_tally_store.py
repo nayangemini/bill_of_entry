@@ -137,3 +137,33 @@ def test_seller_crud(store):
         assert found and found.country == "China"
     finally:
         assert store.delete_seller(name)
+
+
+@integration
+def test_bulk_add_stock_items(store):
+    tag = uuid.uuid4().hex[:8]
+    names = [f"BULK {tag} A", f"BULK {tag} B", f"bulk {tag} a"]  # last is a dup
+    try:
+        added = store.add_stock_items(names)
+        assert added == 2  # dup ignored (case-insensitive)
+        listed = store.list_stock_items()
+        assert f"BULK {tag} A" in listed and f"BULK {tag} B" in listed
+    finally:
+        store.delete_stock_item(f"BULK {tag} A")
+        store.delete_stock_item(f"BULK {tag} B")
+
+
+@integration
+def test_bulk_add_buyers_and_sellers(store):
+    tag = uuid.uuid4().hex[:8]
+    b = [BuyerRecord(name=f"BB {tag} 1", gstin="27X"), BuyerRecord(name=f"BB {tag} 2")]
+    s = [SellerRecord(name=f"SS {tag} 1", country="China")]
+    try:
+        assert store.add_buyers(b) == 2
+        assert store.add_sellers(s) == 1
+        assert store.find_buyer(f"BB {tag} 1").gstin == "27X"
+        assert store.find_seller(f"SS {tag} 1").country == "China"
+    finally:
+        store.delete_buyer(f"BB {tag} 1")
+        store.delete_buyer(f"BB {tag} 2")
+        store.delete_seller(f"SS {tag} 1")
