@@ -347,6 +347,7 @@ class ExcelGenerator:
         self._write_item_table(ws, doc.lines, doc.header.usd_rate, flags)
         self._write_totals_row(ws, doc.totals, doc.lines, totals_row)
         self._write_aux_templates(ws, shift, totals_row)
+        self._write_footer_details(ws, doc.header, shift)
         return wb
 
     # ------------------------------------------------------------------
@@ -723,6 +724,32 @@ class ExcelGenerator:
             total_usd = ws.cell(row=totals_row, column=COL_AMOUNT).value
             if total_usd is not None:
                 ws[target] = total_usd
+
+    # ------------------------------------------------------------------
+    # 'customer and other expenses' footer detail cells (column E)
+    # ------------------------------------------------------------------
+    def _write_footer_details(
+        self, ws: Worksheet, header: HeaderBlock, shift: int
+    ) -> None:
+        """Populate the 'customer and other expenses' footer (column E) from THIS
+        document's header.
+
+        The workbook is built by cloning a style template that carries the
+        original sample BOE's values in these cells (E75 B/E NO, E76 B/E DATE,
+        E77 BL NO, E78 BL DATE). Without this step those template values bleed
+        through and appear "defaulted" on every conversion. Each cell is always
+        overwritten - with the BOE value, or cleared (``None``) when the field is
+        missing - so no stale template data survives (mirrors the top Header_Block,
+        Req 4.3/4.4). Rows shift down by ``shift`` under item-table overflow.
+        """
+        footer_col = 5  # column E - the value column of the footer block
+        for base_row, raw in (
+            (75, header.be_no),    # B/E NO
+            (76, header.be_date),  # B/E DATE
+            (77, header.bl_no),    # BL NO
+            (78, header.bl_date),  # BL DATE
+        ):
+            ws.cell(row=base_row + shift, column=footer_col).value = _raw_cell_value(raw)
 
     # ------------------------------------------------------------------
     # Small writing helpers
