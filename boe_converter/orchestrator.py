@@ -259,32 +259,43 @@ class ConversionOrchestrator:
     def _attach_cartons(
         self, extracted: ExtractedDocument, invoice_raw: bytes
     ) -> ExtractedDocument:
-        """Attach per-line carton counts from the supplier invoice (by serial).
+        """Enrich line items from the supplier invoice / packing list (by serial).
 
-        Parses the invoice's ``TOTAL CTNS`` column and rebuilds each
-        ``LineItem`` whose serial appears in the invoice with its carton count
-        set (Excel column ``G``). Lines absent from the invoice keep a blank
-        carton cell. Any failure (unreadable invoice, unexpected layout) is
-        swallowed and logged - the BOE conversion proceeds without cartons so an
-        optional, malformed invoice never fails the whole conversion.
+        Parses the invoice line table and, for each ``LineItem`` whose serial
+        appears there, sets the per-line carton count (``TOTAL CTNS`` -> Excel
+        column ``G``) and overrides the description with the invoice's
+        ``DESCRIPTION OF GOODS`` (Excel column ``E`` / the stock name), which the
+        user prefers over the terser BOE description when an invoice is supplied.
+        Lines absent from the invoice keep their BOE values. Any failure
+        (unreadable invoice, unexpected layout) is swallowed and logged - the BOE
+        conversion proceeds unchanged so an optional, malformed invoice never
+        fails the whole conversion.
         """
         try:
             import io
 
-            cartons = self.invoice_parser.parse_cartons(io.BytesIO(invoice_raw))
+            details = self.invoice_parser.parse_line_details(io.BytesIO(invoice_raw))
         except Exception:
-            logger.exception("Invoice carton extraction failed; proceeding without CTN")
+            logger.exception("Invoice extraction failed; proceeding without invoice data")
             return extracted
 
-        if not cartons:
+        if not details:
             return extracted
 
-        new_items = [
-            replace(item, cartons=cartons[item.item_serial])
-            if item.item_serial in cartons
-            else item
-            for item in extracted.line_items
-        ]
+        new_items = []
+        for item in extracted.line_items:
+            detail = details.get(item.item_serial)
+            if not detail:
+                new_items.append(item)
+                continue
+            changes = {}
+            if detail.get("cartons") is not None:
+                changes["cartons"] = detail["cartons"]
+            # When the invoice provides a description for this line, it takes
+            # precedence over the BOE description (Excel column E / stock name).
+            if detail.get("description") is not None:
+                changes["description"] = detail["description"]
+            new_items.append(replace(item, **changes) if changes else item)
         return replace(extracted, line_items=new_items)
 
     # ------------------------------------------------------------------

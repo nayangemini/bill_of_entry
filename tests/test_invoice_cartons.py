@@ -80,15 +80,23 @@ def test_lineitem_cartons_defaults_to_missing():
 # Orchestrator carton enrichment (stubbed invoice parser, no real PDF)
 # ---------------------------------------------------------------------------
 class _StubInvoiceParser:
-    def __init__(self, mapping):
-        self._mapping = mapping
+    def __init__(self, cartons=None, descriptions=None):
+        self._cartons = dict(cartons or {})
+        self._descriptions = dict(descriptions or {})
 
-    def parse_cartons(self, doc):  # noqa: ANN001
-        return dict(self._mapping)
+    def parse_line_details(self, doc):  # noqa: ANN001
+        serials = set(self._cartons) | set(self._descriptions)
+        return {
+            s: {
+                "cartons": self._cartons.get(s),
+                "description": self._descriptions.get(s),
+            }
+            for s in serials
+        }
 
 
 class _RaisingInvoiceParser:
-    def parse_cartons(self, doc):  # noqa: ANN001
+    def parse_line_details(self, doc):  # noqa: ANN001
         raise ValueError("bad invoice")
 
 
@@ -115,6 +123,34 @@ def test_attach_cartons_empty_mapping_leaves_lines_unchanged():
     orch = ConversionOrchestrator(invoice_parser=_StubInvoiceParser({}))
     enriched = orch._attach_cartons(_extracted(2), b"%PDF-fake")
     assert all(li.cartons.is_missing for li in enriched.line_items)
+
+
+def test_attach_invoice_overrides_description():
+    """An invoice description replaces the BOE description (even without cartons)."""
+    orch = ConversionOrchestrator(
+        invoice_parser=_StubInvoiceParser(
+            cartons={1: _num(5)},
+            descriptions={1: _num("INVOICE NAME ONE"), 2: _num("INVOICE NAME TWO")},
+        )
+    )
+    enriched = orch._attach_cartons(_extracted(2), b"%PDF-fake")
+    by_serial = {li.item_serial: li for li in enriched.line_items}
+    assert by_serial[1].description.parsed == "INVOICE NAME ONE"
+    assert by_serial[1].cartons.parsed == 5
+    # Line 2 gets the invoice description even though it has no carton count.
+    assert by_serial[2].description.parsed == "INVOICE NAME TWO"
+    assert by_serial[2].cartons.is_missing is True
+
+
+def test_attach_invoice_keeps_boe_description_when_invoice_has_none():
+    """A line absent from the invoice keeps its BOE description."""
+    orch = ConversionOrchestrator(
+        invoice_parser=_StubInvoiceParser(descriptions={1: _num("ONLY ONE")})
+    )
+    enriched = orch._attach_cartons(_extracted(2), b"%PDF-fake")
+    by_serial = {li.item_serial: li for li in enriched.line_items}
+    assert by_serial[1].description.parsed == "ONLY ONE"
+    assert by_serial[2].description.parsed == "item 2"  # unchanged BOE description
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +197,14 @@ def test_invoice_parser_reads_total_ctns_column():
     # Blank carton cells in the invoice produce no entry.
     assert 37 not in cartons
     assert 52 not in cartons
+
+
+@pytest.mark.skipif(not INVOICE_PDF.exists(), reason="invoice asset missing")
+def test_invoice_parser_reads_descriptions():
+    details = InvoicePackingListParser().parse_line_details(str(INVOICE_PDF))
+    assert details[1]["description"].parsed == "SLIDERS (GARMENT ACCESSORY)"
+    assert details[2]["description"].parsed == "KEYCHAIN"
+    assert details[3]["description"].parsed == "NAIL CUTTER"
 
 
 @pytest.mark.skipif(

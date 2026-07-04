@@ -47,19 +47,33 @@ class InvoicePackingListParser:
     def parse_cartons(self, doc) -> dict[int, RawValue]:
         """Return ``{serial: cartons}`` read from the invoice pages of ``doc``.
 
-        ``doc`` may be a path, bytes buffer, or an opened ``pdfplumber.PDF``.
-        Only the invoice line table is read (the packing-list pages and the
-        totals row are skipped); blank carton cells produce no entry.
+        Backward-compatible wrapper over :meth:`parse_line_details`.
+        """
+        return {
+            serial: detail["cartons"]
+            for serial, detail in self.parse_line_details(doc).items()
+            if detail.get("cartons") is not None
+        }
+
+    def parse_line_details(self, doc) -> dict[int, dict]:
+        """Return ``{serial: {"cartons": RawValue|None, "description": RawValue|None}}``.
+
+        Reads the invoice line table (packing-list pages and the totals row are
+        skipped). For each line the per-line carton count (``TOTAL CTNS`` column)
+        and the ``DESCRIPTION OF GOODS`` text are captured, keyed by ``SR NO``
+        (which maps 1:1 to the BOE line serial). Blank cells yield ``None`` for
+        that field. ``doc`` may be a path, bytes buffer, or an opened
+        ``pdfplumber.PDF``.
         """
         handle, pages, should_close = self._resolve(doc)
         try:
-            cartons: dict[int, RawValue] = {}
+            details: dict[int, dict] = {}
             for page in pages:
                 text = page.extract_text() or ""
                 if not self._is_invoice_page(text):
                     continue
-                self._parse_page(page, cartons)
-            return cartons
+                self._parse_page(page, details)
+            return details
         finally:
             if should_close and handle is not None:
                 try:
@@ -120,12 +134,14 @@ class InvoicePackingListParser:
                     return self._center(w)
         return None
 
-    def _parse_page(self, page, cartons: dict[int, RawValue]) -> None:
+    def _parse_page(self, page, details: dict[int, dict]) -> None:
         rows = self._rows(page)
         ctns_center = self._ctns_center(rows)
         if ctns_center is None:
             return
         lo, hi = ctns_center - _CTNS_BAND, ctns_center + _CTNS_BAND
+        # The description column sits between the SR NO column and the CTNS band.
+        desc_hi = ctns_center - _CTNS_BAND
 
         for row in rows:
             ordered = sorted(row, key=lambda w: float(w["x0"]))
@@ -148,6 +164,8 @@ class InvoicePackingListParser:
                 continue
 
             serial = int(sr_word["text"].strip())
+            entry = details.setdefault(serial, {"cartons": None, "description": None})
+
             # Carton count: a numeric token whose centre falls in the CTNS band.
             ctn_word = next(
                 (w for w in ordered
@@ -155,9 +173,18 @@ class InvoicePackingListParser:
                  and self._is_number(w["text"])),
                 None,
             )
-            if ctn_word is None:
-                continue  # blank carton cell -> leave this line blank
-            cartons[serial] = self._carton_value(ctn_word["text"].strip())
+            if ctn_word is not None:
+                entry["cartons"] = self._carton_value(ctn_word["text"].strip())
+
+            # Description: all tokens between the SR NO column and the CTNS band,
+            # left-to-right (e.g. "SLIDERS (GARMENT ACCESSORY)").
+            desc_words = [
+                w for w in ordered
+                if _SR_NO_MAX_X <= self._center(w) < desc_hi
+            ]
+            desc = " ".join(w["text"].strip() for w in desc_words).strip()
+            if desc:
+                entry["description"] = RawValue(raw_text=desc, parsed=desc)
 
     @staticmethod
     def _is_number(text: str) -> bool:
