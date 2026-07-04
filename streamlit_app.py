@@ -132,6 +132,24 @@ def _get_store():
 # ---------------------------------------------------------------------------
 # Stored-data manager (Neon): view / add / edit / delete + bulk upload
 # ---------------------------------------------------------------------------
+# The companies whose Tally stock-name mappings are kept separately. Step 2 and
+# the stored-data manager are scoped to the selected company so each company's
+# mapping dropdown shows only its own stock names.
+COMPANIES = ["Gemini Impex", "Gemini Unicom LLP", "Gemini International", "Pratik HUF"]
+
+
+def _company_options(store, StoreError) -> list[str]:
+    """The known companies plus any extra ones already present in the store."""
+    options = list(COMPANIES)
+    try:
+        for c in store.list_companies():
+            if c and c not in options:
+                options.append(c)
+    except StoreError:
+        pass
+    return options
+
+
 _ADDR_SEP = " | "
 
 
@@ -205,9 +223,16 @@ def _render_data_manager() -> None:
 
 
 def _manage_stock(store, StoreError) -> None:
-    st.caption("Canonical Tally stock-item names offered in Step 2's dropdown.")
+    st.caption(
+        "Canonical Tally stock-item names, kept separately per company. Pick a "
+        "company to view/edit its list; Step 2's dropdown filters by the same "
+        "company."
+    )
+    company = st.selectbox(
+        "Company", _company_options(store, StoreError), key="stock_mgr_company"
+    )
     try:
-        current = store.list_stock_items()
+        current = store.list_stock_items(company)
     except StoreError as exc:
         st.error(str(exc))
         return
@@ -217,37 +242,45 @@ def _manage_stock(store, StoreError) -> None:
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
-        key="stock_grid",
+        key=f"stock_grid_{company}",
         column_config={"name": st.column_config.TextColumn("Stock name", required=True)},
     )
     c1, c2 = st.columns([1, 2])
     if c1.button("💾 Save changes", key="save_stock"):
-        new_names = [str(r.get("name", "")).strip() for r in edited]
-        new_names = [n for n in new_names if n]
+        new_names = [str(r.get("name", "")).strip() for r in edited if str(r.get("name", "")).strip()]
         new_lower = {n.lower() for n in new_names}
         old_lower = {n.lower() for n in current}
-        for n in current:  # deletions
+        for n in current:  # deletions (scoped to this company)
             if n.lower() not in new_lower:
-                store.delete_stock_item(n)
-        added = store.add_stock_items([n for n in new_names if n.lower() not in old_lower])
-        st.success(f"Saved. {added} added, {len(old_lower - new_lower)} deleted.")
+                store.delete_stock_item(n, company)
+        added = store.add_stock_items(
+            [n for n in new_names if n.lower() not in old_lower], company
+        )
+        st.success(f"Saved for {company}. {added} added, {len(old_lower - new_lower)} deleted.")
         st.rerun()
     c2.download_button(
         "⬇ Export CSV",
-        data=_csv_bytes([{"name": n} for n in current], ["name"]),
-        file_name="stock_names.csv",
+        data=_csv_bytes([{"name": n, "company": company} for n in current], ["name", "company"]),
+        file_name=f"stock_names_{company.replace(' ', '_')}.csv",
         mime="text/csv",
         key="dl_stock",
     )
 
-    st.markdown("**Bulk upload** — CSV/Excel with a `name` column (or one name per row).")
+    st.markdown(
+        "**Bulk upload** — CSV/Excel with a `name` column. Add a `company` column "
+        f"to target specific companies, otherwise rows are added to **{company}**."
+    )
     up = st.file_uploader("Upload stock names", type=["csv", "xlsx"], key="bulk_stock")
     if up is not None and st.button("Import stock names", key="imp_stock"):
-        rows = _read_uploaded_table(up)
-        names = [_first(r, "name", "stock name", "stockitemname") for r in rows]
-        names = [n for n in names if n]
-        added = store.add_stock_items(names)
-        st.success(f"Imported {added} new name(s) ({len(names) - added} already present).")
+        pairs = []
+        for r in _read_uploaded_table(up):
+            name = _first(r, "name", "stock name", "stockitemname")
+            if not name:
+                continue
+            comp = _first(r, "company", "company name") or company
+            pairs.append((name, comp))
+        added = store.add_stock_items(pairs, company)
+        st.success(f"Imported {added} new name(s) ({len(pairs) - added} already present).")
         st.rerun()
 
 
@@ -576,28 +609,42 @@ if _computed is None:
     st.info("Convert a Bill of Entry in Step 1 to map its line items here.")
 else:
     store = _get_store()
+    from boe_converter.tally_store import StoreError
+
+    # Company scope: the mapping dropdown lists only the selected company's names.
+    company = st.selectbox(
+        "Company (Tally)",
+        _company_options(store, StoreError) if store is not None else COMPANIES,
+        key="step2_company",
+        help="The Tally company whose stock-name list drives the dropdown below.",
+    )
+    st.session_state["tally_company"] = company
+
     stock_options = []
     if store is not None:
-        from boe_converter.tally_store import StoreError
-
         try:
-            stock_options = store.list_stock_items()
+            stock_options = store.list_stock_items(company)
         except StoreError as exc:
             st.error(str(exc))
+    if not stock_options:
+        st.info(
+            f"No stored stock names for **{company}** yet. Add them in "
+            "“📇 Manage stored data → Stock names” (pick this company)."
+        )
 
     # Pre-select from the current mapping so choices survive edits.
     rows = _line_rows(_computed, st.session_state.get("tally_map", {}))
 
     edited = st.data_editor(
         rows,
-        key="tally_editor",
+        key=f"tally_editor_{company}",
         use_container_width=True,
         hide_index=True,
         disabled=["Sr", "Description", "HSN", "Qty", "Unit"],
         column_config={
             "As per Tally name": st.column_config.SelectboxColumn(
                 "As per Tally name",
-                help="Exact Tally stock name (managed in the sidebar).",
+                help=f"Exact Tally stock name for {company} (managed in the data panel).",
                 options=stock_options,
                 required=False,
             )

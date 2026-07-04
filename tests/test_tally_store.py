@@ -111,6 +111,29 @@ def test_stock_item_add_list_delete(store):
 
 
 @integration
+def test_stock_items_scoped_by_company(store):
+    tag = uuid.uuid4().hex[:8]
+    name = f"WIDGET {tag}"
+    ca, cb = f"CoA {tag}", f"CoB {tag}"
+    try:
+        # Same stock name can exist under two different companies.
+        assert store.add_stock_item(name, ca)
+        assert store.add_stock_item(name, cb)
+        # Same name+company is de-duplicated (case-insensitive).
+        assert not store.add_stock_item(name.lower(), ca)
+        assert store.list_stock_items(ca) == [name]
+        assert store.list_stock_items(cb) == [name]
+        assert ca in store.list_companies() and cb in store.list_companies()
+        # Deleting for one company leaves the other intact.
+        assert store.delete_stock_item(name, ca)
+        assert store.list_stock_items(ca) == []
+        assert store.list_stock_items(cb) == [name]
+    finally:
+        store.delete_stock_item(name, ca)
+        store.delete_stock_item(name, cb)
+
+
+@integration
 def test_buyer_crud(store):
     name = f"TEST BUYER {uuid.uuid4().hex[:8]}"
     try:
@@ -142,15 +165,30 @@ def test_seller_crud(store):
 @integration
 def test_bulk_add_stock_items(store):
     tag = uuid.uuid4().hex[:8]
+    comp = f"BulkCo {tag}"
     names = [f"BULK {tag} A", f"BULK {tag} B", f"bulk {tag} a"]  # last is a dup
     try:
-        added = store.add_stock_items(names)
+        added = store.add_stock_items(names, comp)
         assert added == 2  # dup ignored (case-insensitive)
-        listed = store.list_stock_items()
+        listed = store.list_stock_items(comp)
         assert f"BULK {tag} A" in listed and f"BULK {tag} B" in listed
     finally:
-        store.delete_stock_item(f"BULK {tag} A")
-        store.delete_stock_item(f"BULK {tag} B")
+        store.delete_stock_item(f"BULK {tag} A", comp)
+        store.delete_stock_item(f"BULK {tag} B", comp)
+
+
+@integration
+def test_bulk_add_stock_items_with_per_row_company(store):
+    tag = uuid.uuid4().hex[:8]
+    ca, cb = f"CoA {tag}", f"CoB {tag}"
+    rows = [(f"P {tag}", ca), (f"Q {tag}", cb)]
+    try:
+        assert store.add_stock_items(rows) == 2
+        assert store.list_stock_items(ca) == [f"P {tag}"]
+        assert store.list_stock_items(cb) == [f"Q {tag}"]
+    finally:
+        store.delete_stock_item(f"P {tag}", ca)
+        store.delete_stock_item(f"Q {tag}", cb)
 
 
 @integration

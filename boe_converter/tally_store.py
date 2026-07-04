@@ -137,10 +137,15 @@ class TallyStore:
         ddl = """
         CREATE TABLE IF NOT EXISTS stock_items (
             id SERIAL PRIMARY KEY,
-            name TEXT NOT NULL
+            name TEXT NOT NULL,
+            company TEXT NOT NULL DEFAULT ''
         );
-        CREATE UNIQUE INDEX IF NOT EXISTS stock_items_lname
-            ON stock_items (lower(name));
+        -- Migrate an existing (pre-company) table and switch to a per-company
+        -- unique index so the same stock name can exist for different companies.
+        ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS company TEXT NOT NULL DEFAULT '';
+        DROP INDEX IF EXISTS stock_items_lname;
+        CREATE UNIQUE INDEX IF NOT EXISTS stock_items_company_lname
+            ON stock_items (lower(company), lower(name));
         CREATE TABLE IF NOT EXISTS buyers (
             id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
@@ -191,46 +196,70 @@ class TallyStore:
         except Exception as exc:
             raise StoreError(f"Database write failed: {exc}") from exc
 
-    # -- stock items --------------------------------------------------------
-    def list_stock_items(self) -> list[str]:
-        rows = self._query("SELECT name FROM stock_items ORDER BY lower(name)")
+    # -- stock items (scoped by company) -----------------------------------
+    def list_companies(self) -> list[str]:
+        """Distinct company names that have stored stock items."""
+        rows = self._query(
+            "SELECT DISTINCT company FROM stock_items "
+            "WHERE company <> '' ORDER BY company"
+        )
+        return [r["company"] for r in rows]
+
+    def list_stock_items(self, company: str | None = None) -> list[str]:
+        """Stock names, optionally filtered to a single company."""
+        if company is None:
+            rows = self._query("SELECT name FROM stock_items ORDER BY lower(name)")
+        else:
+            rows = self._query(
+                "SELECT name FROM stock_items WHERE lower(company) = lower(%s) "
+                "ORDER BY lower(name)",
+                (company.strip(),),
+            )
         return [r["name"] for r in rows]
 
-    def add_stock_item(self, name: str) -> bool:
+    def add_stock_item(self, name: str, company: str = "") -> bool:
         name = name.strip()
         if not name:
             return False
         n = self._exec_returning(
-            "INSERT INTO stock_items (name) VALUES (%s) "
-            "ON CONFLICT (lower(name)) DO NOTHING",
-            (name,),
+            "INSERT INTO stock_items (name, company) VALUES (%s, %s) "
+            "ON CONFLICT (lower(company), lower(name)) DO NOTHING",
+            (name, company.strip()),
         )
         return n > 0
 
-    def add_stock_items(self, names) -> int:
-        """Bulk-add stock names in ONE connection (case-insensitive de-dup).
+    def add_stock_items(self, names, company: str = "") -> int:
+        """Bulk-add stock names for a company in ONE connection.
 
-        Returns the number of rows actually inserted (existing names ignored).
+        ``names`` may be an iterable of plain names (all assigned to ``company``)
+        or of ``(name, company)`` pairs (per-row company; the ``company`` arg is
+        the default when a pair omits it). Case-insensitive de-dup per company.
+        Returns the number of rows actually inserted.
         """
         from psycopg2.extras import execute_values
 
-        seen: set[str] = set()
-        rows: list[tuple[str]] = []
-        for name in names:
-            if not isinstance(name, str):
+        seen: set[tuple[str, str]] = set()
+        rows: list[tuple[str, str]] = []
+        for entry in names:
+            if isinstance(entry, (tuple, list)):
+                name = str(entry[0]).strip() if entry and entry[0] is not None else ""
+                comp = (str(entry[1]).strip() if len(entry) > 1 and entry[1] else company).strip()
+            elif isinstance(entry, str):
+                name, comp = entry.strip(), company.strip()
+            else:
                 continue
-            n = name.strip()
-            if n and n.lower() not in seen:
-                seen.add(n.lower())
-                rows.append((n,))
+            key = (comp.lower(), name.lower())
+            if name and key not in seen:
+                seen.add(key)
+                rows.append((name, comp))
         if not rows:
             return 0
         try:
             with self._cursor() as (_conn, cur):
                 execute_values(
                     cur,
-                    "INSERT INTO stock_items (name) VALUES %s "
-                    "ON CONFLICT (lower(name)) DO NOTHING",
+                    "INSERT INTO stock_items (name, company) VALUES %s "
+                    "ON CONFLICT (lower(company), lower(name)) DO NOTHING",
                     rows,
                 )
                 count = cur.rowcount
@@ -240,10 +269,17 @@ class TallyStore:
         except Exception as exc:
             raise StoreError(f"Bulk stock insert failed: {exc}") from exc
 
-    def delete_stock_item(self, name: str) -> bool:
-        n = self._exec_returning(
-            "DELETE FROM stock_items WHERE lower(name) = lower(%s)", (name.strip(),)
-        )
+    def delete_stock_item(self, name: str, company: str | None = None) -> bool:
+        if company is None:
+            n = self._exec_returning(
+                "DELETE FROM stock_items WHERE lower(name) = lower(%s)", (name.strip(),)
+            )
+        else:
+            n = self._exec_returning(
+                "DELETE FROM stock_items WHERE lower(name) = lower(%s) "
+                "AND lower(company) = lower(%s)",
+                (name.strip(), company.strip()),
+            )
         return n > 0
 
     # -- buyers -------------------------------------------------------------
