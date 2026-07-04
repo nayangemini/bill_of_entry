@@ -152,6 +152,7 @@ class ValueCalculator:
         assessable = _as_number(item.assessable_value)
         bcd_amount = _as_number(item.bcd_amount)
         chcess_amount = _as_number(getattr(item, "chcess_amount", None))
+        other_duties_total = _as_number(getattr(item, "other_duties_total", None))
         igst_rate = _as_number(item.igst_rate)
         rate = _coerce_number(usd_rate)
 
@@ -172,13 +173,18 @@ class ValueCalculator:
         purchase_inr = (
             amount_usd * rate if amount_usd is not None and rate is not None else None
         )
-        # CUST AIDC (Excel col U) = BCD amount + additional cess (CHCESS, when
-        # present on the BOE; absent -> 0). SWS and the customs-duty total are
-        # computed on this combined base, matching the BOE (SWS = 10% of BCD +
-        # CHCESS) and the sample workbook.
-        cust_aidc = (
-            bcd_amount + (chcess_amount or 0.0) if bcd_amount is not None else None
-        )
+        # CUST AIDC (Excel col U) = the sum of ALL non-IGST, non-SWS customs
+        # duties printed on the BOE (BCD + CHCESS + CVD + SAD + G.CESS + ADD +
+        # CAIDC + NCD + AGGR + any other cess/duty), extracted as
+        # ``other_duties_total``. IGST has its own column and SWS is added on top
+        # as 10% (below), so both are excluded from this base. When the duty-grid
+        # sum could not be read, fall back to BCD + CHCESS so nothing regresses.
+        if other_duties_total is not None:
+            cust_aidc = other_duties_total
+        elif bcd_amount is not None:
+            cust_aidc = bcd_amount + (chcess_amount or 0.0)
+        else:
+            cust_aidc = None
         sws_amount = cust_aidc * self.SWS_RATE if cust_aidc is not None else None
         total_customs_duty = (
             cust_aidc + sws_amount

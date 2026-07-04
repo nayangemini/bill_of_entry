@@ -70,6 +70,39 @@ _GSTIN_STATE = {
     "38": "Ladakh",
 }
 
+# Customs duty heads (normalised: leading "N." stripped, non-alphanumerics
+# removed, upper-cased) that are SUMMED into the CUST AIDC base (Excel col U).
+# IGST (its own column) and SWS (added separately as 10%) are deliberately
+# excluded, as are non-duty total/value/charge columns (T.VALUE, TOT.ASS,
+# TOTAL DUTY, INT, PNLTY, FINE, TOT.AMOUNT).
+_DUTY_HEADS_TO_SUM = {
+    "BCD", "ACD", "CVD", "CVD05", "SAD", "NCCD", "ADD", "SG", "GCESS",
+    "SAED", "GSIA", "TTA", "HEALTH", "HEALTHCESS", "HCESS", "SPEXD", "CHCESS",
+    "CESS", "CAIDC", "EAIDC", "CUSEDC", "CUSHEC", "NCD", "AGGR", "OTHCUS",
+    "OTHCVD", "PETRCUS", "INFRACES", "CUSCVD",
+}
+# Non-summed columns that still appear in the duty grids. They are recognised so
+# they act as column boundaries when windowing the ``Amount`` row, but are never
+# added to the base: IGST (own column), SWS (added as 10%), and the various
+# total / value / charge columns.
+_DUTY_NON_SUM_LABELS = {
+    "IGST", "SWS", "TVALUE", "TOTASS", "TOTASSVAL", "VAL", "TOTALDUTY", "TOTAL",
+    "INT", "PNLTY", "FINE", "TOTAMOUNT", "TOTAMT",
+}
+# Every recognised duty-grid column label (used only to detect a grid header
+# and to derive column boundaries, regardless of any leading ``N.`` index).
+_DUTY_GRID_LABELS = _DUTY_HEADS_TO_SUM | _DUTY_NON_SUM_LABELS
+
+
+def _norm_duty_label(text: str) -> str:
+    """Normalise a duty-grid column label for whitelist matching.
+
+    Strips a leading ``N.`` index and every non-alphanumeric character, then
+    upper-cases (``"2.CVD_05"`` -> ``"CVD05"``, ``"6.G.CESS"`` -> ``"GCESS"``).
+    """
+    stripped = re.sub(r"^\d+\.", "", text)
+    return re.sub(r"[^A-Za-z0-9]", "", stripped).upper()
+
 
 @dataclass(frozen=True)
 class Word:
@@ -129,6 +162,9 @@ class DutyItemRow:
     igst_rate: RawValue         # IGST Rate, as a decimal fraction (Req 3.11)
     total_duty: RawValue        # 30. TOTAL DUTY (Req 3.12)
     chcess_amount: RawValue = field(default_factory=RawValue.missing)  # 2.CHCESS (rare)
+    # Sum of all non-IGST, non-SWS duty amounts across the Part III duty grids
+    # (BCD + CHCESS + CVD + SAD + G.CESS + ADD + CAIDC + NCD + AGGR + ...).
+    other_duties_total: RawValue = field(default_factory=RawValue.missing)
 
 
 @dataclass(frozen=True)
@@ -1282,6 +1318,7 @@ class PdfParser:
         assessable, total_duty = self._duty_assess_total(block)
         bcd_rate, bcd_amount, sws_amount, igst_rate = self._duty_grid(block)
         chcess_amount = self._chcess_amount(block)
+        other_duties_total = self._other_duties_total(block)
 
         return serial, DutyItemRow(
             item_serial=serial,
@@ -1292,7 +1329,52 @@ class PdfParser:
             igst_rate=igst_rate,
             total_duty=total_duty,
             chcess_amount=chcess_amount,
+            other_duties_total=other_duties_total,
         )
+
+    def _other_duties_total(self, block) -> RawValue:
+        """Sum every non-IGST, non-SWS customs-duty ``Amount`` cell in the block.
+
+        Walks each duty-grid header (a row carrying >=3 numbered ``N.LABEL``
+        tokens that intersect the known duty heads), reads the ``Amount`` sub-row
+        beneath it, and sums the numeric value under each column whose normalised
+        label is a duty head in :data:`_DUTY_HEADS_TO_SUM` (so IGST, SWS and the
+        total/value/penalty columns are skipped). Each column's value window runs
+        from just left of its label to just left of the next label. Returns the
+        summed value (Excel CUST AIDC, column U), or missing when no duty grid /
+        amount cell is found (the calculator then falls back to BCD + CHCESS).
+        """
+        total = 0.0
+        found = False
+        for bi, row in enumerate(block):
+            # Column labels are matched by normalised name (prefix-agnostic), so
+            # both bare heads (``BCD``) and numbered ones (``5.IGST``) are caught.
+            labels = [w for w in row if _norm_duty_label(w.text) in _DUTY_GRID_LABELS]
+            if len(labels) < 3:
+                continue
+            amount_row = self._first_row_starting(block, bi + 1, "amount")
+            if amount_row is None:
+                continue
+            labels_sorted = sorted(labels, key=lambda w: w.x0)
+            xs = [w.x0 for w in labels_sorted]
+            for idx, w in enumerate(labels_sorted):
+                if _norm_duty_label(w.text) not in _DUTY_HEADS_TO_SUM:
+                    continue  # skips IGST, SWS, totals, values, penalties
+                # Each column's value window spans the midpoints to its
+                # neighbouring labels (``_token_in_range`` matches by centre),
+                # extended by one gap at the two ends so edge columns are caught.
+                left_gap = (xs[idx] - xs[idx - 1]) if idx > 0 else (
+                    xs[1] - xs[0] if len(xs) > 1 else 40.0
+                )
+                right_gap = (xs[idx + 1] - xs[idx]) if idx + 1 < len(xs) else left_gap
+                x_lo = xs[idx] - left_gap / 2.0 if idx > 0 else xs[idx] - left_gap
+                x_hi = xs[idx] + right_gap / 2.0
+                text = self._token_in_range(amount_row, x_lo, x_hi)
+                value = self._parse_number(text) if text else None
+                if value is not None:
+                    total += value
+                    found = True
+        return self._capture(repr(total), numeric=True) if found else RawValue.missing()
 
     def _chcess_amount(self, block) -> RawValue:
         """Additional customs cess (Part III ``C. OTHER DUTIES`` -> ``2.CHCESS``).
@@ -1504,6 +1586,9 @@ class PdfParser:
             chcess_amount = (
                 duty_row.chcess_amount if duty_row else RawValue.missing()
             )
+            other_duties_total = (
+                duty_row.other_duties_total if duty_row else RawValue.missing()
+            )
 
             line_items.append(
                 LineItem(
@@ -1519,6 +1604,7 @@ class PdfParser:
                     igst_rate=igst_rate,
                     total_duty=total_duty,
                     chcess_amount=chcess_amount,
+                    other_duties_total=other_duties_total,
                 )
             )
 

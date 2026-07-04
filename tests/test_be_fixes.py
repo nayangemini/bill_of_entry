@@ -67,6 +67,42 @@ def test_no_chcess_leaves_cust_aidc_equal_to_bcd():
     assert line.total_customs_duty == pytest.approx(5157.46)
 
 
+# ---------------------------------------------------------------------------
+# All non-IGST, non-SWS duties summed into the CUST AIDC base
+# ---------------------------------------------------------------------------
+def test_other_duties_total_drives_cust_aidc():
+    """When the BOE duty-grid sum is present it is the CUST AIDC base directly.
+
+    ``other_duties_total`` already includes BCD, CHCESS and every other non-IGST,
+    non-SWS duty (CVD, SAD, G.CESS, CAIDC, NCD, AGGR, ...). SWS is then 10% of it
+    and IGST is computed on assessable + total customs duty.
+    """
+    # BCD 4688.6 + CVD 1000 + SAD 500 + CAIDC 250 = 6438.6 (say).
+    item = _line(bcd_amount=_num(4688.6), other_duties_total=_num(6438.6))
+    line = ValueCalculator().compute_line(item, 94.2)
+    assert line.cust_aidc == pytest.approx(6438.6)              # the summed base
+    assert line.sws_amount == pytest.approx(643.86)             # 10% of the base
+    assert line.total_customs_duty == pytest.approx(7082.46)    # base + SWS
+
+
+def test_other_duties_total_overrides_bcd_plus_chcess():
+    """The summed base wins over the BCD+CHCESS fallback when both are present."""
+    item = _line(
+        bcd_amount=_num(1000.0),
+        chcess_amount=_num(200.0),
+        other_duties_total=_num(1750.0),  # includes bcd+chcess plus other duties
+    )
+    line = ValueCalculator().compute_line(item, 94.2)
+    assert line.cust_aidc == pytest.approx(1750.0)
+
+
+def test_missing_other_duties_total_falls_back_to_bcd_plus_chcess():
+    """No duty-grid sum -> fall back to BCD + CHCESS (no regression)."""
+    item = _line(bcd_amount=_num(1000.0), chcess_amount=_num(200.0))
+    line = ValueCalculator().compute_line(item, 94.2)
+    assert line.cust_aidc == pytest.approx(1200.0)
+
+
 def test_chcess_missing_input_treated_as_zero():
     """A missing/blank CHCESS contributes nothing."""
     item = _line(chcess_amount=RawValue.missing())

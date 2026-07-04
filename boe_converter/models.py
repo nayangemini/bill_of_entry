@@ -94,6 +94,12 @@ class LineItem:
     # When present it is added to the BCD amount to form the customs-duty base
     # (CUST AIDC, Excel column U); defaults to missing (treated as 0).
     chcess_amount: RawValue = field(default_factory=RawValue.missing)
+    # Sum of ALL non-IGST, non-SWS customs duty amounts printed on the BOE
+    # (BCD + CHCESS + CVD + SAD + G.CESS + ADD + CAIDC + NCD + AGGR + any other
+    # cess/duty). This is the CUST AIDC base (Excel column U); SWS is added on
+    # top as 10% (column W) and IGST is a separate column, so both are excluded.
+    # Missing -> the calculator falls back to BCD + CHCESS.
+    other_duties_total: RawValue = field(default_factory=RawValue.missing)
     # Per-line carton (CTN) count for Excel column G. Not present in the BOE
     # itself; optionally supplied from the supplier invoice and joined on
     # ``item_serial`` (defaults to missing -> the CTN cell stays blank).
