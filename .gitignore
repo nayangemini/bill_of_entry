@@ -40,6 +40,11 @@ PRATIK C SANGHAVI (HUF) 1071 CTN BE.pdf
 Master.json
 Purchase_2022823.json
 AccountingVouchers.xlsx
+# Per-company Tally stock masters (commercial; loaded into Neon, not committed)
+HUF Master.xlsx
+Impex Stock Master.xlsx
+International Master.xlsx
+LLP Stock Master.xlsx
 
 # --- Editor / OS ---
 .vscode/
