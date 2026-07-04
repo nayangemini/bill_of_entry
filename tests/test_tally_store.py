@@ -163,6 +163,24 @@ def test_seller_crud(store):
 
 
 @integration
+def test_stock_item_carries_hs_code(store):
+    tag = uuid.uuid4().hex[:8]
+    comp = f"HsCo {tag}"
+    name = f"WIDGET {tag}"
+    try:
+        assert store.add_stock_item(name, comp, "96071190")
+        full = store.list_stock_items_full(comp)
+        assert (name, "96071190") in full
+        # replace_company_stock updates HS codes and handles renames/deletes.
+        store.replace_company_stock(comp, [(name, "42029900"), (f"NEW {tag}", "")])
+        got = dict(store.list_stock_items_full(comp))
+        assert got[name] == "42029900"
+        assert got[f"NEW {tag}"] == ""
+    finally:
+        store.replace_company_stock(comp, [])
+
+
+@integration
 def test_bulk_add_stock_items(store):
     tag = uuid.uuid4().hex[:8]
     comp = f"BulkCo {tag}"

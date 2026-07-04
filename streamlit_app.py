@@ -232,55 +232,60 @@ def _manage_stock(store, StoreError) -> None:
         "Company", _company_options(store, StoreError), key="stock_mgr_company"
     )
     try:
-        current = store.list_stock_items(company)
+        current = store.list_stock_items_full(company)  # [(name, hs_code)]
     except StoreError as exc:
         st.error(str(exc))
         return
 
     edited = st.data_editor(
-        [{"name": n} for n in current],
+        [{"name": n, "hs_code": hs} for n, hs in current],
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
         key=f"stock_grid_{company}",
-        column_config={"name": st.column_config.TextColumn("Stock name", required=True)},
+        column_config={
+            "name": st.column_config.TextColumn("Stock name", required=True),
+            "hs_code": st.column_config.TextColumn("HS code (reference only)"),
+        },
     )
     c1, c2 = st.columns([1, 2])
     if c1.button("💾 Save changes", key="save_stock"):
-        new_names = [str(r.get("name", "")).strip() for r in edited if str(r.get("name", "")).strip()]
-        new_lower = {n.lower() for n in new_names}
-        old_lower = {n.lower() for n in current}
-        for n in current:  # deletions (scoped to this company)
-            if n.lower() not in new_lower:
-                store.delete_stock_item(n, company)
-        added = store.add_stock_items(
-            [n for n in new_names if n.lower() not in old_lower], company
-        )
-        st.success(f"Saved for {company}. {added} added, {len(old_lower - new_lower)} deleted.")
+        entries = [
+            (str(r.get("name", "")).strip(), str(r.get("hs_code", "") or "").strip())
+            for r in edited
+            if str(r.get("name", "")).strip()
+        ]
+        written = store.replace_company_stock(company, entries)
+        st.success(f"Saved {written} stock name(s) for {company}.")
         st.rerun()
     c2.download_button(
         "⬇ Export CSV",
-        data=_csv_bytes([{"name": n, "company": company} for n in current], ["name", "company"]),
+        data=_csv_bytes(
+            [{"name": n, "hs_code": hs, "company": company} for n, hs in current],
+            ["name", "hs_code", "company"],
+        ),
         file_name=f"stock_names_{company.replace(' ', '_')}.csv",
         mime="text/csv",
         key="dl_stock",
     )
 
     st.markdown(
-        "**Bulk upload** — CSV/Excel with a `name` column. Add a `company` column "
-        f"to target specific companies, otherwise rows are added to **{company}**."
+        "**Bulk upload** — CSV/Excel with `name` (and optional `hs_code`) columns. "
+        f"Add a `company` column to target specific companies, otherwise rows are "
+        f"added to **{company}**."
     )
     up = st.file_uploader("Upload stock names", type=["csv", "xlsx"], key="bulk_stock")
     if up is not None and st.button("Import stock names", key="imp_stock"):
-        pairs = []
+        triples = []
         for r in _read_uploaded_table(up):
             name = _first(r, "name", "stock name", "stockitemname")
             if not name:
                 continue
             comp = _first(r, "company", "company name") or company
-            pairs.append((name, comp))
-        added = store.add_stock_items(pairs, company)
-        st.success(f"Imported {added} new name(s) ({len(pairs) - added} already present).")
+            hs = _first(r, "hs_code", "hs code", "hscode", "hsn", "hsn code")
+            triples.append((name, comp, hs))
+        added = store.add_stock_items(triples, company)
+        st.success(f"Imported {added} new name(s) ({len(triples) - added} already present).")
         st.rerun()
 
 
@@ -454,11 +459,22 @@ def _num(rv) -> str:
     return str(getattr(rv, "raw_text", "") or "")
 
 
-def _line_rows(computed, tally_map: dict):
-    """Rows for the Step-2 editor from a ComputedDocument."""
+def _line_rows(computed, tally_map: dict, name_to_display: dict | None = None):
+    """Rows for the Step-2 editor from a ComputedDocument.
+
+    ``tally_map`` maps serial -> chosen stock NAME. When ``name_to_display`` is
+    given the dropdown shows display labels (``name  ·  HS code``); the mapped
+    name is converted to its display label for pre-selection (or left blank when
+    that name isn't in the current company's list).
+    """
     rows = []
     for line in computed.lines:
         src = line.source
+        mapped = tally_map.get(src.item_serial)
+        if mapped and name_to_display is not None:
+            value = name_to_display.get(mapped)  # None if not in this company
+        else:
+            value = mapped
         rows.append(
             {
                 "Sr": src.item_serial,
@@ -466,7 +482,7 @@ def _line_rows(computed, tally_map: dict):
                 "HSN": _num(src.cth_hsn) or (src.cth_hsn.raw_text or ""),
                 "Qty": _num(src.quantity),
                 "Unit": _num(src.unit) or (src.unit.raw_text or ""),
-                "As per Tally name": tally_map.get(src.item_serial),
+                "As per Tally name": value,
             }
         )
     return rows
@@ -620,20 +636,28 @@ else:
     )
     st.session_state["tally_company"] = company
 
-    stock_options = []
+    full = []
     if store is not None:
         try:
-            stock_options = store.list_stock_items(company)
+            full = store.list_stock_items_full(company)  # [(name, hs_code)]
         except StoreError as exc:
             st.error(str(exc))
-    if not stock_options:
+    if not full:
         st.info(
             f"No stored stock names for **{company}** yet. Add them in "
             "“📇 Manage stored data → Stock names” (pick this company)."
         )
 
-    # Pre-select from the current mapping so choices survive edits.
-    rows = _line_rows(_computed, st.session_state.get("tally_map", {}))
+    # Dropdown labels show the HS code for reference, but only the NAME is used.
+    def _label(name: str, hs: str) -> str:
+        return f"{name}   ·   HS {hs}" if hs else name
+
+    name_to_display = {name: _label(name, hs) for name, hs in full}
+    display_to_name = {disp: name for name, disp in name_to_display.items()}
+    stock_options = list(display_to_name.keys())
+
+    # Pre-select from the current mapping (name -> display label) so choices survive edits.
+    rows = _line_rows(_computed, st.session_state.get("tally_map", {}), name_to_display)
 
     edited = st.data_editor(
         rows,
@@ -644,18 +668,22 @@ else:
         column_config={
             "As per Tally name": st.column_config.SelectboxColumn(
                 "As per Tally name",
-                help=f"Exact Tally stock name for {company} (managed in the data panel).",
+                help=(
+                    f"Exact Tally stock name for {company} (HS code shown for "
+                    "reference only; the name is what gets used)."
+                ),
                 options=stock_options,
                 required=False,
             )
         },
     )
 
-    # Rebuild the serial -> chosen-name mapping from the editor.
+    # Rebuild the serial -> chosen-NAME mapping (strip the HS-code display label).
     mapping = {}
     for r in edited:
-        name = r.get("As per Tally name")
-        if name:
+        display = r.get("As per Tally name")
+        if display:
+            name = display_to_name.get(display, display)
             try:
                 mapping[int(r["Sr"])] = str(name)
             except (TypeError, ValueError):

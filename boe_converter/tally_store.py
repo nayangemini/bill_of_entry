@@ -138,11 +138,14 @@ class TallyStore:
         CREATE TABLE IF NOT EXISTS stock_items (
             id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
-            company TEXT NOT NULL DEFAULT ''
+            company TEXT NOT NULL DEFAULT '',
+            hs_code TEXT NOT NULL DEFAULT ''
         );
-        -- Migrate an existing (pre-company) table and switch to a per-company
-        -- unique index so the same stock name can exist for different companies.
+        -- Migrate an existing (pre-company / pre-hs_code) table and switch to a
+        -- per-company unique index so the same stock name can exist for
+        -- different companies.
         ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS company TEXT NOT NULL DEFAULT '';
+        ALTER TABLE stock_items ADD COLUMN IF NOT EXISTS hs_code TEXT NOT NULL DEFAULT '';
         DROP INDEX IF EXISTS stock_items_lname;
         CREATE UNIQUE INDEX IF NOT EXISTS stock_items_company_lname
             ON stock_items (lower(company), lower(name));
@@ -217,33 +220,53 @@ class TallyStore:
             )
         return [r["name"] for r in rows]
 
-    def add_stock_item(self, name: str, company: str = "") -> bool:
+    def list_stock_items_full(self, company: str | None = None) -> list[tuple[str, str]]:
+        """``(name, hs_code)`` pairs, optionally filtered to a single company.
+
+        The HS code is reference-only (shown beside the name in the dropdown);
+        only the name is ever used as the mapped value.
+        """
+        if company is None:
+            rows = self._query(
+                "SELECT name, hs_code FROM stock_items ORDER BY lower(name)"
+            )
+        else:
+            rows = self._query(
+                "SELECT name, hs_code FROM stock_items WHERE lower(company) = lower(%s) "
+                "ORDER BY lower(name)",
+                (company.strip(),),
+            )
+        return [(r["name"], r.get("hs_code") or "") for r in rows]
+
+    def add_stock_item(self, name: str, company: str = "", hs_code: str = "") -> bool:
         name = name.strip()
         if not name:
             return False
         n = self._exec_returning(
-            "INSERT INTO stock_items (name, company) VALUES (%s, %s) "
+            "INSERT INTO stock_items (name, company, hs_code) VALUES (%s, %s, %s) "
             "ON CONFLICT (lower(company), lower(name)) DO NOTHING",
-            (name, company.strip()),
+            (name, company.strip(), hs_code.strip()),
         )
         return n > 0
 
     def add_stock_items(self, names, company: str = "") -> int:
         """Bulk-add stock names for a company in ONE connection.
 
-        ``names`` may be an iterable of plain names (all assigned to ``company``)
-        or of ``(name, company)`` pairs (per-row company; the ``company`` arg is
-        the default when a pair omits it). Case-insensitive de-dup per company.
-        Returns the number of rows actually inserted.
+        ``names`` may be an iterable of plain names (assigned to ``company``),
+        ``(name, company)`` pairs, or ``(name, company, hs_code)`` triples (the
+        ``company`` arg is the default when an entry omits it). Case-insensitive
+        de-dup per company. Returns the number of rows actually inserted.
         """
         from psycopg2.extras import execute_values
 
         seen: set[tuple[str, str]] = set()
-        rows: list[tuple[str, str]] = []
+        rows: list[tuple[str, str, str]] = []
         for entry in names:
+            hs = ""
             if isinstance(entry, (tuple, list)):
                 name = str(entry[0]).strip() if entry and entry[0] is not None else ""
                 comp = (str(entry[1]).strip() if len(entry) > 1 and entry[1] else company).strip()
+                hs = str(entry[2]).strip() if len(entry) > 2 and entry[2] else ""
             elif isinstance(entry, str):
                 name, comp = entry.strip(), company.strip()
             else:
@@ -251,14 +274,14 @@ class TallyStore:
             key = (comp.lower(), name.lower())
             if name and key not in seen:
                 seen.add(key)
-                rows.append((name, comp))
+                rows.append((name, comp, hs))
         if not rows:
             return 0
         try:
             with self._cursor() as (_conn, cur):
                 execute_values(
                     cur,
-                    "INSERT INTO stock_items (name, company) VALUES %s "
+                    "INSERT INTO stock_items (name, company, hs_code) VALUES %s "
                     "ON CONFLICT (lower(company), lower(name)) DO NOTHING",
                     rows,
                 )
@@ -281,6 +304,47 @@ class TallyStore:
                 (name.strip(), company.strip()),
             )
         return n > 0
+
+    def replace_company_stock(self, company: str, entries) -> int:
+        """Replace a company's entire stock list with ``entries`` in ONE txn.
+
+        ``entries`` is an iterable of ``(name, hs_code)`` pairs. Every existing
+        row for ``company`` is deleted first, then the new set is inserted, so
+        renames, HS-code edits and deletions all take effect. Returns the number
+        of rows written.
+        """
+        from psycopg2.extras import execute_values
+
+        company = company.strip()
+        seen: set[str] = set()
+        rows: list[tuple[str, str, str]] = []
+        for entry in entries:
+            if isinstance(entry, (tuple, list)):
+                name = str(entry[0]).strip() if entry and entry[0] is not None else ""
+                hs = str(entry[1]).strip() if len(entry) > 1 and entry[1] else ""
+            else:
+                name, hs = str(entry).strip(), ""
+            if name and name.lower() not in seen:
+                seen.add(name.lower())
+                rows.append((name, company, hs))
+        try:
+            with self._cursor() as (_conn, cur):
+                cur.execute(
+                    "DELETE FROM stock_items WHERE lower(company) = lower(%s)",
+                    (company,),
+                )
+                if rows:
+                    execute_values(
+                        cur,
+                        "INSERT INTO stock_items (name, company, hs_code) VALUES %s "
+                        "ON CONFLICT (lower(company), lower(name)) DO NOTHING",
+                        rows,
+                    )
+                return len(rows)
+        except StoreError:
+            raise
+        except Exception as exc:
+            raise StoreError(f"Replace company stock failed: {exc}") from exc
 
     # -- buyers -------------------------------------------------------------
     def list_buyers(self) -> list[BuyerRecord]:
