@@ -99,17 +99,26 @@ def _database_url() -> str | None:
     return val or os.environ.get("DATABASE_URL") or os.environ.get("NEON_DATABASE_URL")
 
 
-@st.cache_resource
+# Whether the schema has been ensured this process (idempotent, run once).
+_SCHEMA_READY = False
+
+
 def _store():
     """Connect to Neon and ensure the schema exists.
 
-    Returns the store on success, or ``(None, error_message)`` never - instead
-    the caller uses :func:`_get_store` which surfaces a clear error.
+    The store is NOT cached as a resource: it only holds a connection string and
+    opens short-lived connections, and caching a stale instance across a code
+    update caused ``AttributeError`` when new methods were added. Constructing it
+    fresh each run always uses the current class; the (idempotent) schema init
+    runs only once per process.
     """
+    global _SCHEMA_READY
     from boe_converter.tally_store import TallyStore
 
     store = TallyStore(dsn=_database_url())
-    store.init_schema()
+    if not _SCHEMA_READY:
+        store.init_schema()
+        _SCHEMA_READY = True
     return store
 
 
@@ -142,10 +151,11 @@ def _company_options(store, StoreError) -> list[str]:
     """The known companies plus any extra ones already present in the store."""
     options = list(COMPANIES)
     try:
-        for c in store.list_companies():
-            if c and c not in options:
-                options.append(c)
-    except StoreError:
+        if store is not None and hasattr(store, "list_companies"):
+            for c in store.list_companies():
+                if c and c not in options:
+                    options.append(c)
+    except Exception:
         pass
     return options
 
