@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 try:  # psycopg2 is the Postgres driver; a clear error is raised if it is absent.
@@ -93,10 +94,37 @@ class TallyStore:
                 "and that the Neon project is active."
             ) from exc
 
+    @contextmanager
+    def _cursor(self, *, dict_rows: bool = False):
+        """Yield a cursor with per-transaction timeout guards, ALWAYS closing the
+        connection afterwards.
+
+        psycopg2's ``with connection`` only ends the transaction, not the socket;
+        leaving it open leaks connections and can exhaust Neon's free-tier limit.
+        Timeouts are applied with ``SET LOCAL`` (the Neon pooler rejects them as
+        startup ``options``) so a query fails fast instead of hanging on a lock.
+        """
+        conn = self._connect()
+        try:
+            factory = RealDictCursor if dict_rows else None
+            with conn.cursor(cursor_factory=factory) as cur:
+                cur.execute(
+                    "SET LOCAL statement_timeout=15000; "
+                    "SET LOCAL lock_timeout=8000; "
+                    "SET LOCAL idle_in_transaction_session_timeout=15000"
+                )
+                yield conn, cur
+                conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def ping(self) -> None:
         """Raise :class:`StoreError` unless a trivial query succeeds."""
         try:
-            with self._connect() as conn, conn.cursor() as cur:
+            with self._cursor() as (_conn, cur):
                 cur.execute("SELECT 1")
                 cur.fetchone()
         except StoreError:
@@ -135,9 +163,8 @@ class TallyStore:
     # -- low-level exec helpers --------------------------------------------
     def _exec(self, sql: str, params: tuple = ()) -> None:
         try:
-            with self._connect() as conn, conn.cursor() as cur:
+            with self._cursor() as (_conn, cur):
                 cur.execute(sql, params)
-                conn.commit()
         except StoreError:
             raise
         except Exception as exc:
@@ -145,7 +172,7 @@ class TallyStore:
 
     def _query(self, sql: str, params: tuple = ()) -> list[dict]:
         try:
-            with self._connect() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            with self._cursor(dict_rows=True) as (_conn, cur):
                 cur.execute(sql, params)
                 return list(cur.fetchall())
         except StoreError:
@@ -156,11 +183,9 @@ class TallyStore:
     def _exec_returning(self, sql: str, params: tuple = ()) -> int:
         """Execute a write and return the number of affected rows."""
         try:
-            with self._connect() as conn, conn.cursor() as cur:
+            with self._cursor() as (_conn, cur):
                 cur.execute(sql, params)
-                count = cur.rowcount
-                conn.commit()
-                return count
+                return cur.rowcount
         except StoreError:
             raise
         except Exception as exc:
@@ -183,12 +208,37 @@ class TallyStore:
         return n > 0
 
     def add_stock_items(self, names) -> int:
-        """Bulk-add stock names (case-insensitive de-dup). Returns count added."""
-        added = 0
+        """Bulk-add stock names in ONE connection (case-insensitive de-dup).
+
+        Returns the number of rows actually inserted (existing names ignored).
+        """
+        from psycopg2.extras import execute_values
+
+        seen: set[str] = set()
+        rows: list[tuple[str]] = []
         for name in names:
-            if isinstance(name, str) and self.add_stock_item(name):
-                added += 1
-        return added
+            if not isinstance(name, str):
+                continue
+            n = name.strip()
+            if n and n.lower() not in seen:
+                seen.add(n.lower())
+                rows.append((n,))
+        if not rows:
+            return 0
+        try:
+            with self._cursor() as (_conn, cur):
+                execute_values(
+                    cur,
+                    "INSERT INTO stock_items (name) VALUES %s "
+                    "ON CONFLICT (lower(name)) DO NOTHING",
+                    rows,
+                )
+                count = cur.rowcount
+                return count if count and count > 0 else 0
+        except StoreError:
+            raise
+        except Exception as exc:
+            raise StoreError(f"Bulk stock insert failed: {exc}") from exc
 
     def delete_stock_item(self, name: str) -> bool:
         n = self._exec_returning(
@@ -224,12 +274,31 @@ class TallyStore:
         return True
 
     def add_buyers(self, buyers) -> int:
-        """Bulk add/replace buyer records (keyed by name). Returns count saved."""
-        saved = 0
-        for b in buyers:
-            if self.add_buyer(b):
-                saved += 1
-        return saved
+        """Bulk add/replace buyer records in ONE connection. Returns count saved."""
+        rows = [
+            (
+                b.name.strip(), b.gstin, b.state, b.pincode,
+                json.dumps(b.address_lines),
+            )
+            for b in buyers if b.name.strip()
+        ]
+        if not rows:
+            return 0
+        try:
+            with self._cursor() as (_conn, cur):
+                cur.executemany(
+                    "INSERT INTO buyers (name, gstin, state, pincode, address_lines) "
+                    "VALUES (%s, %s, %s, %s, %s::jsonb) "
+                    "ON CONFLICT (lower(name)) DO UPDATE SET "
+                    "gstin = EXCLUDED.gstin, state = EXCLUDED.state, "
+                    "pincode = EXCLUDED.pincode, address_lines = EXCLUDED.address_lines",
+                    rows,
+                )
+                return len(rows)
+        except StoreError:
+            raise
+        except Exception as exc:
+            raise StoreError(f"Bulk buyer insert failed: {exc}") from exc
 
     def delete_buyer(self, name: str) -> bool:
         n = self._exec_returning(
@@ -265,12 +334,27 @@ class TallyStore:
         return True
 
     def add_sellers(self, sellers) -> int:
-        """Bulk add/replace seller records (keyed by name). Returns count saved."""
-        saved = 0
-        for s in sellers:
-            if self.add_seller(s):
-                saved += 1
-        return saved
+        """Bulk add/replace seller records in ONE connection. Returns count saved."""
+        rows = [
+            (s.name.strip(), s.country, json.dumps(s.address_lines))
+            for s in sellers if s.name.strip()
+        ]
+        if not rows:
+            return 0
+        try:
+            with self._cursor() as (_conn, cur):
+                cur.executemany(
+                    "INSERT INTO sellers (name, country, address_lines) "
+                    "VALUES (%s, %s, %s::jsonb) "
+                    "ON CONFLICT (lower(name)) DO UPDATE SET "
+                    "country = EXCLUDED.country, address_lines = EXCLUDED.address_lines",
+                    rows,
+                )
+                return len(rows)
+        except StoreError:
+            raise
+        except Exception as exc:
+            raise StoreError(f"Bulk seller insert failed: {exc}") from exc
 
     def delete_seller(self, name: str) -> bool:
         n = self._exec_returning(
