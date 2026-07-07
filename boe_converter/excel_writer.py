@@ -47,12 +47,14 @@ from io import BytesIO
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill
 from openpyxl.utils.cell import coordinate_to_tuple, get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from boe_converter.models import (
     ComputedDocument,
     ComputedLine,
+    GrandTotalVerification,
     HeaderBlock,
     RawValue,
     ReviewFlagSet,
@@ -127,6 +129,21 @@ TOTALS_ROW = 61
 
 # The constant SWS rate written into column V for every line item (sample V=0.1).
 SWS_RATE = 0.10
+
+# Maps a grand-total verification column letter (Req 11) to the Totals_Row
+# column index whose cell is red-filled on a MISMATCH: P -> TOTAL Custom Duty,
+# Q -> GST, S -> total custom duty.
+GRAND_TOTAL_FILL_COLUMNS: dict[str, int] = {
+    "P": COL_TOTAL_CUSTOM_DUTY,
+    "Q": COL_GST,
+    "S": COL_TOTAL_CUSTOM_DUTY_2,
+}
+
+# Solid red fill applied to a Totals_Row cell whose grand total mismatches the
+# BOE declared value (Req 11.4). MATCH/UNVERIFIED columns stay unstyled.
+GRAND_TOTAL_MISMATCH_FILL = PatternFill(
+    fill_type="solid", fgColor="FFFF0000", start_color="FFFF0000"
+)
 
 # ---------------------------------------------------------------------------
 # Auxiliary template labels, captured character-for-character from the sample
@@ -304,19 +321,34 @@ class ExcelGenerator:
         """
         self.use_formulas = use_formulas
 
-    def generate(self, doc: ComputedDocument, flags: ReviewFlagSet) -> bytes:
+    def generate(
+        self,
+        doc: ComputedDocument,
+        flags: ReviewFlagSet,
+        grand_total_check: GrandTotalVerification | None = None,
+    ) -> bytes:
         """Build ``Sheet1`` in the exact CTN layout and return ``.xlsx`` bytes.
 
         Constructs the workbook in memory (header block + item table) and
         serialises it. The Totals_Row and auxiliary templates are added by
         task 7.2's ``_write_totals_row`` / ``_write_aux_templates``.
+
+        When ``grand_total_check`` is supplied, the Totals_Row cells whose grand
+        total mismatches the BOE declared value are red-filled (Req 11.4, 11.5,
+        11.7). When it is ``None`` no fills are applied and the output is
+        identical to the un-verified workbook.
         """
-        wb = self.build_workbook(doc, flags)
+        wb = self.build_workbook(doc, flags, grand_total_check)
         buffer = BytesIO()
         wb.save(buffer)
         return buffer.getvalue()
 
-    def build_workbook(self, doc: ComputedDocument, flags: ReviewFlagSet) -> Workbook:
+    def build_workbook(
+        self,
+        doc: ComputedDocument,
+        flags: ReviewFlagSet,
+        grand_total_check: GrandTotalVerification | None = None,
+    ) -> Workbook:
         """Assemble the workbook from the bundled CTN style template.
 
         Loads ``ctn_template.xlsx`` (which carries the sample's exact column
@@ -346,6 +378,7 @@ class ExcelGenerator:
         self._write_header_block(ws, doc.header, flags)
         self._write_item_table(ws, doc.lines, doc.header.usd_rate, flags)
         self._write_totals_row(ws, doc.totals, doc.lines, totals_row)
+        self._apply_grand_total_fills(ws, totals_row, grand_total_check)
         self._write_aux_templates(ws, shift, totals_row)
         self._write_footer_details(ws, doc.header, shift)
         return wb
@@ -485,16 +518,18 @@ class ExcelGenerator:
         Labels (column D/F) are reproduced verbatim from the sample. Values
         (column E/G) are written exactly as extracted, without reformatting the
         number/date values (Req 4.2-4.5). A value flagged missing/unreadable, and
-        every no-source field (``Eway bill no/date``, ``RETTENCE DATE/RATE``,
-        ``USD Amt``), is left blank with no characters or placeholder (Req 4.8,
-        4.9, 8.6).
+        every no-source field (``Eway bill no/date``, ``RETTENCE DATE/RATE``) is
+        left blank with no characters or placeholder (Req 4.8, 4.9, 8.6). The
+        ``USD Amt`` (G3) and ``USD Rate`` (G2) cells are now sourced from the BOE
+        (Req 12): G3 from the USD invoice amount, G2 from the BOE exchange rate
+        with a fallback to the User-supplied rate.
         """
         # --- fixed labels (column D and F) ---
         ws["D1"] = "Company name"
         ws["D2"] = "Party Name"
         ws["F2"] = "USD Rate"
         ws["D3"] = "Details"
-        ws["F3"] = "USD Amt"          # no-source label; value cell stays blank
+        ws["F3"] = "USD Amt"          # value (G3) sourced from the BOE (Req 12.2)
         ws["D4"] = "Invoice No"
         ws["F4"] = "Inv Date"
         ws["D5"] = "BE No"
@@ -512,16 +547,24 @@ class ExcelGenerator:
             ws["E1"] = header.company_name
 
         self._set_if_value(ws, "E2", _raw_cell_value(header.party_name))   # Req 4.1
-        # USD Rate is User-supplied; write at its full numeric precision (Req 4.5).
-        if header.usd_rate is not None:
+        # USD Rate (G2): prefer the BOE-printed exchange rate at full precision
+        # (Req 12.3); fall back to the User-supplied rate when the BOE does not
+        # print one (Req 12.4). A missing BOE rate is never inferred.
+        boe_rate = _raw_cell_value(getattr(header, "usd_rate_boe", None))
+        if boe_rate is not None:
+            ws["G2"] = boe_rate
+        elif header.usd_rate is not None:
             ws["G2"] = header.usd_rate
+        # USD Amt (G3): the BOE total invoice amount in USD, full precision, no
+        # reformatting; left blank when missing/unresolved (Req 12.2, 12.5).
+        self._set_if_value(ws, "G3", _raw_cell_value(header.invoice_amount))  # Req 12.2
         self._set_if_value(ws, "E3", _raw_cell_value(header.details))      # Req 4.6
         self._set_if_value(ws, "E4", _raw_cell_value(header.invoice_no))   # Req 4.2
-        self._set_if_value(ws, "G4", _raw_cell_value(header.invoice_date)) # Req 4.2
+        self._set_if_value(ws, "G4", _raw_cell_value(header.invoice_date)) # Req 4.2/13.1
         self._set_if_value(ws, "E5", _raw_cell_value(header.be_no))        # Req 4.3
-        self._set_if_value(ws, "G5", _raw_cell_value(header.be_date))      # Req 4.3
+        self._set_if_value(ws, "G5", _raw_cell_value(header.be_date))      # Req 4.3/13.1
         self._set_if_value(ws, "E6", _raw_cell_value(header.bl_no))        # Req 4.4
-        self._set_if_value(ws, "G6", _raw_cell_value(header.bl_date))      # Req 4.4
+        self._set_if_value(ws, "G6", _raw_cell_value(header.bl_date))      # Req 4.4/13.1
 
     # ------------------------------------------------------------------
     # Item table (header row 12, data from row 13)
@@ -592,8 +635,14 @@ class ExcelGenerator:
         # BCD amount when no cess is present (cust_aidc == bcd_amount).
         self._set_cell(ws, row, COL_CUST_AIDC, line.cust_aidc)
 
-        # Constant SWS rate (column V) - sample writes 0.1 on every line.
-        ws.cell(row=row, column=COL_RATE_OF_INTEREST_SWS, value=SWS_RATE)
+        # SWS rate (column V): write the ACTUAL per-line rate the BOE declares
+        # when it is available (an exemption 0 is honoured as 0); otherwise keep
+        # the historical 0.1 default so existing behaviour is preserved (Req 15).
+        sws_rate_val = _raw_number(item.sws_rate)
+        if sws_rate_val is not None:
+            self._set_rate_cell(ws, row, COL_RATE_OF_INTEREST_SWS, sws_rate_val)
+        else:
+            ws.cell(row=row, column=COL_RATE_OF_INTEREST_SWS, value=SWS_RATE)
 
         # GST/IGST amount (column Q) is a literal in the sample (manually keyed),
         # so it is always written as a value and is referenced by the S and X
@@ -607,7 +656,17 @@ class ExcelGenerator:
         # 6.13) leaves the cell blank in both modes so the formula never turns a
         # missing input into a spurious 0.
         qty = _raw_number(item.quantity)
-        self._put_computed(ws, row, COL_PCS, line.pcs, f"=H{row}*12")
+        # pcs = qty * pcs_factor(unit); the factor comes from the shared units
+        # table via the calculator (DOZ=12, GRS=144, THD=1000). Render it without
+        # a trailing .0 for whole numbers (via _num) so the formula reads
+        # ``=H13*144`` not ``=H13*144.0``. When the line has no factor, line.pcs
+        # is None and _put_computed leaves the cell blank.
+        pcs_formula = (
+            f"=H{row}*{self._num(line.pcs_factor)}"
+            if line.pcs_factor is not None
+            else f"=H{row}"
+        )
+        self._put_computed(ws, row, COL_PCS, line.pcs, pcs_formula)
         self._put_computed(ws, row, COL_AMOUNT, line.amount_usd, f"=H{row}*K{row}")
         self._put_computed(
             ws, row, COL_RATE_PER_USD, line.purchase_inr, f"=L{row}*{self._num(usd_rate)}"
@@ -693,6 +752,29 @@ class ExcelGenerator:
             ws, row, COL_LAND_COST_WITH_GST, "X", first, last,
             totals.total_land_cost_incl_gst,
         )
+
+    def _apply_grand_total_fills(
+        self,
+        ws: Worksheet,
+        totals_row: int,
+        grand_total_check: GrandTotalVerification | None,
+    ) -> None:
+        """Red-fill the Totals_Row cells whose grand total mismatches the BOE.
+
+        For each column letter in ``grand_total_check.highlight_columns`` (the
+        MISMATCH columns; Req 11.4) the mapped Totals_Row cell (P -> TOTAL Custom
+        Duty, Q -> GST, S -> total custom duty) is given a solid red fill (Req
+        11.5, 11.7). MATCH and UNVERIFIED columns are left unstyled. When
+        ``grand_total_check`` is ``None`` nothing is changed, so the un-verified
+        output is preserved exactly.
+        """
+        if grand_total_check is None:
+            return
+        for column in grand_total_check.highlight_columns:
+            col_index = GRAND_TOTAL_FILL_COLUMNS.get(column)
+            if col_index is None:
+                continue
+            ws.cell(row=totals_row, column=col_index).fill = GRAND_TOTAL_MISMATCH_FILL
 
     # ------------------------------------------------------------------
     # Auxiliary template sections (labels only; data cells empty)

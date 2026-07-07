@@ -183,7 +183,7 @@ class _FakeParser:
 class _FakeGenerator:
     """Fake Excel generator: returns fixed bytes for a successful build."""
 
-    def generate(self, computed, flags: ReviewFlagSet) -> bytes:
+    def generate(self, computed, flags: ReviewFlagSet, grand_total_check=None) -> bytes:
         return b"xlsx"
 
 

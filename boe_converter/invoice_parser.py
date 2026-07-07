@@ -56,7 +56,7 @@ class InvoicePackingListParser:
         }
 
     def parse_line_details(self, doc) -> dict[int, dict]:
-        """Return ``{serial: {"cartons": RawValue|None, "description": RawValue|None}}``.
+        """Return ``{serial: {"cartons", "description"}}`` per line.
 
         Reads the invoice line table (packing-list pages and the totals row are
         skipped). For each line the per-line carton count (``TOTAL CTNS`` column)

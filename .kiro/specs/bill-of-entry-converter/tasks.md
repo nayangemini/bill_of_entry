@@ -224,14 +224,114 @@ prior ones and ends wired into the running system, leaving no orphaned code.
 - [x] 12. Final checkpoint - Ensure all tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
+## Grand-Total Verification (Requirements 10 & 11)
+
+The tasks below extend the completed Milestone 1 system with Part I duty-summary extraction and
+grand-total verification with red-fill highlighting. They build on the existing components without
+altering Milestone 1 behavior: the parser gains one extraction stage, the orchestrator gains one
+cross-check and reorders `convert()` so verification runs before `generate()`, and the Excel_Generator
+gains conditional red fills on the Totals_Row. Property tests map 1:1 to design Properties 18–20 and use
+the 1.00 INR tolerance; example tests assert extraction against both reference BOEs.
+
+- [x] 13. Extend shared data models for grand-total verification
+  - [x] 13.1 Add declared duty-summary fields and grand-total verification models
+    - In `boe_converter/models.py`, add `declared_bcd`, `declared_sws`, `declared_igst`, and
+      `declared_total_duty` `RawValue` fields to `HeaderBlock`, each with
+      `field(default_factory=RawValue.missing)` so an absent value is never inferred
+    - Add `"GRAND_TOTAL"` to the `Discrepancy.kind` `Literal`
+    - Add the module constant `GRAND_TOTAL_TOLERANCE_INR = 1.00`
+    - Add the frozen dataclasses `GrandTotalCheck` (`column: Literal["P","Q","S"]`, `declared: float|None`,
+      `excel_total: float`, `status: Literal["MATCH","MISMATCH","UNVERIFIED"]`) and
+      `GrandTotalVerification` (`checks: list[GrandTotalCheck]`) with the `highlight_columns` property
+      returning the set of column letters whose check status is `MISMATCH`
+    - _Requirements: 10.1, 10.2, 10.3, 10.4, 11.1, 11.2, 11.3, 11.4_
+
+- [x] 14. Implement duty-summary extraction in the PDF_Parser
+  - [x] 14.1 Implement `_extract_duty_summary` and wire it into `_extract_header`
+    - In `boe_converter/parser.py`, add `_extract_duty_summary(self, pages) -> dict[str, RawValue]`
+      returning `declared_bcd`/`declared_sws`/`declared_igst`/`declared_total_duty`
+    - Reconstruct rows from `_upright_words(page)` (orientation-aware) so rotated margin labels are
+      excluded, locate the Part I `C. DUTY SUMMARY` band and its label tokens (`1.BCD`, `3.SWS`,
+      `7.IGST`, `14.TOTAL DUTY`, accepting the bare `TOTAL DUTY` variant), and read each numeric value
+      with the existing positional column-window approach via `self._capture(raw_text, numeric=True)`
+      (verbatim, non-destructive numeric parse per Req 10.5)
+    - Wire the four `RawValue`s onto `HeaderBlock.declared_bcd`/`declared_sws`/`declared_igst`/
+      `declared_total_duty`; a label found but unresolvable yields `RawValue.unparseable(...)`, a label
+      not found yields `RawValue.missing()`
+    - Emit `ReviewFlag(scope="header", field_name="declared_*", reason="MISSING"|"UNPARSEABLE")` for each
+      missing/unreadable declared value, reported by field name
+    - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6_
+
+  - [ ]* 14.2 Write example extraction tests against both reference BOEs
+    - Assert the four declared duty-summary values for `205090022062026INNSA1BE0230620261842.pdf`
+      (BCD `184250.2`, SWS `18810.2`, IGST `258391`, TOTAL DUTY `465302`) preserving printed digits
+    - Assert extraction against `229411903072026INNSA1BE0040720261315.pdf` to confirm the label
+      set/column geometry generalise beyond the single sample
+    - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5_
+
+  - [ ]* 14.3 Write missing/unreadable duty-summary example test
+    - Assert a missing/unresolvable duty-summary value is recorded as `RawValue.missing()` and produces a
+      reported `declared_*` review flag, with no inferred/default value substituted
+    - _Requirements: 10.6_
+
+- [x] 15. Implement grand-total verification in the Conversion Orchestrator
+  - [x] 15.1 Implement `_check_grand_totals` / `_verify_grand_totals` and reorder `convert()`
+    - In `boe_converter/orchestrator.py`, add `_verify_grand_totals(extracted, computed)` producing a
+      `GrandTotalVerification` from the three comparisons: P (`Totals.total_customs_duty` vs
+      `declared_bcd + declared_sws`), Q (`Totals.total_igst` vs `declared_igst`), and S
+      (`Totals.total_customs_duty + Totals.total_igst` vs `declared_total_duty`), using
+      `GRAND_TOTAL_TOLERANCE_INR` (1.00) — `MATCH` when within tolerance, `MISMATCH` when beyond,
+      `UNVERIFIED` when a required declared value is missing/unreadable (column P is `UNVERIFIED` when
+      either `declared_bcd` or `declared_sws` is missing)
+    - Add `_check_grand_totals(...)` alongside `_check_item_count` / `_check_invoice_total` /
+      `_check_recompute`, emitting `Discrepancy(kind="GRAND_TOTAL", expected=declared, actual=excel_total,
+      message=…names column P/Q/S…)` for each `MISMATCH`, and reporting "the column X grand total could
+      not be verified against the BOE" for each `UNVERIFIED`
+    - Reorder `convert()` so the grand-total verification runs **before** `generate()`, then thread the
+      `GrandTotalVerification` into `generate(...)`
+    - Append the `GRAND_TOTAL` discrepancies into the returned cross-check list so they appear in
+      `ConversionSummary`; never let them affect `output_complete` — the workbook is always retained and
+      downloadable
+    - _Requirements: 11.1, 11.2, 11.3, 11.6, 11.7, 11.8, 11.9_
+
+  - [ ]* 15.2 Write property test for grand-total retention and summary inclusion
+    - **Property 20: Grand-total mismatches are retained and surfaced in the summary**
+    - **Validates: Requirements 11.8, 11.9**
+
+- [x] 16. Implement red-fill highlighting in the Excel_Generator
+  - [x] 16.1 Add the optional `grand_total_check` parameter and apply red fills
+    - In `boe_converter/excel_writer.py`, add `grand_total_check: GrandTotalVerification | None = None` to
+      `generate(...)`; when `None`, preserve exact Milestone 1 behavior (no fills)
+    - After the Totals_Row is written, for each column letter in
+      `grand_total_check.highlight_columns` apply `PatternFill(fill_type="solid", fgColor="FFFF0000",
+      start_color="FFFF0000")` to that Totals_Row cell using column indices P=16, Q=17, S=19 (the existing
+      `COL_*` constants)
+    - Only `MISMATCH` columns are filled; `MATCH` and `UNVERIFIED` columns keep their existing unstyled
+      cells
+    - _Requirements: 11.4, 11.5, 11.7_
+
+  - [ ]* 16.2 Write property test for grand-total mismatch highlight and reporting at the tolerance boundary
+    - **Property 18: Grand-total mismatch beyond tolerance is highlighted red and reported; within tolerance is not**
+    - **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5, 11.6**
+
+  - [ ]* 16.3 Write property test for missing declared value yielding could-not-verify with no fill
+    - **Property 19: Missing declared value yields could-not-verify with no fill**
+    - **Validates: Requirements 10.6, 11.7**
+
+- [x] 17. Checkpoint - Ensure all grand-total verification tests pass
+  - Ensure all tests pass, ask the user if questions arise.
+
 ## Notes
 
 - Tasks marked with `*` are optional and can be skipped for a faster MVP; they cover property, unit, and
   integration tests.
 - Each task references specific requirements (and properties, where applicable) for traceability.
-- Property tests map 1:1 to design Properties 1–17 and use `hypothesis` with `max_examples >= 100`;
-  float comparisons use the 0.01 tolerance where specified and exact equality where full precision is
-  asserted.
+- Property tests map 1:1 to design Properties 1–20 and use `hypothesis` with `max_examples >= 100`;
+  float comparisons use the 0.01 tolerance where specified, the 1.00 INR tolerance for the grand-total
+  checks (Properties 18–20), and exact equality where full precision is asserted.
+- Grand-total verification (Requirements 10 & 11, tasks 13–17) extends Milestone 1 without altering its
+  behavior; `convert()` is reordered so verification runs before `generate()`, and the workbook is always
+  retained and downloadable even on a grand-total mismatch.
 - Checkpoints ensure incremental validation across components.
 - The Value_Calculator and assembly logic are pure; the Orchestrator owns sequencing, cross-checks, and
   atomic output.
@@ -248,7 +348,107 @@ prior ones and ends wired into the running system, leaving no orphaned code.
     { "id": 4, "tasks": ["7.2", "9.3"] },
     { "id": 5, "tasks": ["7.3", "7.4", "7.5", "7.6", "7.7", "9.4", "9.5", "9.6", "9.7", "9.8"] },
     { "id": 6, "tasks": ["11.1"] },
-    { "id": 7, "tasks": ["11.2"] }
+    { "id": 7, "tasks": ["11.2"] },
+    { "id": 8, "tasks": ["13.1"] },
+    { "id": 9, "tasks": ["14.1", "16.1"] },
+    { "id": 10, "tasks": ["15.1"] },
+    { "id": 11, "tasks": ["14.2", "14.3", "15.2", "16.2", "16.3"] }
+  ]
+}
+```
+
+## Milestone 1.1 — Field-Accuracy Corrections (tasks)
+
+These tasks implement the bug-fix batch (Requirements 12–18). They are localized edits to existing
+components; each ends wired into the running system with tests. Reference inputs:
+`3. BE - 221981730062026INNSA1BE0040720261600.pdf`, `INV 1054.pdf`, and the client workbooks
+`bill_of_entry - with mistake.xlsx` / `bill_of_entry - corrected copy.xlsx`.
+
+- [x] 18. Shared unit-to-pieces factor table (DOZ/GRS/THD)
+  - [x] 18.1 Extract the piece-conversion factors into one shared module
+    - Create `boe_converter/units.py` with `UNIT_TO_PCS = {"DOZ": 12.0, "GRS": 144.0, "THD": 1000.0}` and
+      `pcs_factor(unit) -> float | None` (trim + upper-case lookup)
+    - Refactor `tally_exporter._UNIT_TO_PCS` / `_convert_to_pcs` to consume the shared table
+    - _Requirements: 14.6_
+
+- [x] 19. Fix the Excel `pcs` column to convert DOZ/GRS/THD
+  - [x] 19.1 Compute `pcs` with the unit factor in the calculator and writer
+    - In `calculator._pcs`, use `units.pcs_factor(unit)`: `pcs = qty * factor` when a factor exists, else
+      `None`; expose the factor on `ComputedLine` (e.g. `pcs_factor`)
+    - In `excel_writer._write_item_row`, emit `=H{row}*{factor}` (or the literal `qty*factor`) using the
+      line's factor; blank when no factor
+    - _Requirements: 14.1, 14.2, 14.3, 14.4, 14.5_
+  - [ ]* 19.2 Update/extend the pcs property test for GRS and THD
+    - **Property 6 (extended): pcs = QTY×factor for DOZ/GRS/THD, blank otherwise**
+    - _Validates: Requirements 14.1, 14.2, 14.3, 14.4_
+
+- [x] 20. Use the BOE-declared SWS rate instead of a fixed 10%
+  - [x] 20.1 Extract per-line SWS rate/amount and drive the calculator from it
+    - Ensure the parser records per-line `sws_rate` and `sws_amount` (exemption 0 → numeric 0)
+    - In `calculator._compute_line`, compute `sws_amount` from the BOE value (amount if present incl. 0,
+      else `cust_aidc * sws_rate`), falling back to `cust_aidc * 0.10` with a `ReviewFlag` only when no
+      SWS data exists; stop applying the unconditional 10%
+    - Write the actual SWS rate into Excel column V
+    - _Requirements: 15.1, 15.2, 15.3, 15.4, 15.5_
+  - [ ]* 20.2 Property/example test for SWS-from-BOE and the 0% case
+    - Assert a 0 SWS rate yields 0 surcharge and reconciling P/Q/S totals; a present rate is used verbatim
+    - _Validates: Requirements 15.2, 15.3, 15.5_
+
+- [x] 21. Populate USD Amt / USD Rate and keep dates verbatim in the header
+  - [x] 21.1 Header USD amount + rate + verbatim dates
+    - Parser: capture the BOE USD exchange rate into `HeaderBlock.usd_rate_boe` (default missing); confirm
+      the USD invoice amount lands on `HeaderBlock.invoice_amount`; store header dates as verbatim strings
+    - Excel writer: write `G3` from the USD invoice amount; write `G2` from `usd_rate_boe` when present
+      else the User-supplied rate; write header dates as their raw strings (no `datetime` coercion)
+    - _Requirements: 12.1, 12.2, 12.3, 12.4, 12.5, 13.1, 13.2_
+  - [ ]* 21.2 Example test against the reference BOE/invoice and corrected workbook
+    - Assert `G3` = the BOE USD amount (`13757.09` for the reference), `G4` = the verbatim invoice-date
+      string, and `G2` = the rate source per Req 12.3/12.4
+    - _Validates: Requirements 12.2, 12.3, 13.1_
+
+- [ ] 22. Remove round-off from computed and extracted monetary values
+  - [ ] 22.1 Audit and fix precision loss
+    - Locate the rounding that produced `Q15 = 55.3` (IGST/GST); remove value-level rounding on the
+      extraction/calculation path (keep rounding in `number_format` only). Keep Unit Price in USD sourced
+      from the BOE Part II UPI field, not from optional invoice attachments.
+    - _Requirements: 16.1, 16.2, 16.3_
+  - [ ]* 22.2 Regression test asserting full precision
+    - Assert a known line's GST value is written unrounded (e.g. `55.29535`) and the Unit Price in USD
+      cell matches the BOE-extracted UPI value.
+    - _Validates: Requirements 16.1, 16.2_
+
+- [ ] 23. Ensure the grand-total mismatch highlight fires
+  - [~] 23.1 Reconcile the verification basis and confirm the fill persists
+    - After the SWS fix (task 20), confirm `_verify_grand_totals` detects a genuine mismatch and that
+      `generate(...)` receives the `GrandTotalVerification` on every conversion; confirm the red fill on
+      P/Q/S survives to the saved workbook
+    - _Requirements: 17.1, 17.2, 17.3_
+  - [ ]* 23.2 End-to-end test: a mismatching BOE yields a red-filled Totals_Row cell
+    - _Validates: Requirements 17.1, 17.2_
+
+- [ ] 24. Keep NOS-unit line items in the JSON/Tally export
+  - [~] 24.1 Ensure NOS items are extracted and never dropped from the JSON
+    - Confirm `NOS` is accepted by the parser unit allow-list and survives `_merge_items`; ensure
+      `TallyExporter.build` emits an inventory allocation for every line including NOS
+    - _Requirements: 18.1, 18.2, 18.3, 18.4_
+  - [ ]* 24.2 Regression test: a NOS-unit line appears in `allledgerentries` and in the Excel Unit column
+    - _Validates: Requirements 18.2, 18.3_
+
+- [~] 25. Checkpoint — full suite + reference-file conversion
+  - Convert `3. BE - 221981730062026INNSA1BE0040720261600.pdf` with `INV 1054.pdf`; diff the output against
+    `bill_of_entry - corrected copy.xlsx` for the corrected cells (G2/G3/G4, pcs factors, SWS/GST totals,
+    grand-total highlight); ensure all tests pass
+
+## Task Dependency Graph (Milestone 1.1)
+
+```json
+{
+  "waves": [
+    { "id": 0, "tasks": ["18.1"] },
+    { "id": 1, "tasks": ["19.1", "20.1", "21.1", "22.1", "24.1"] },
+    { "id": 2, "tasks": ["23.1"] },
+    { "id": 3, "tasks": ["19.2", "20.2", "21.2", "22.2", "23.2", "24.2"] },
+    { "id": 4, "tasks": ["25"] }
   ]
 }
 ```

@@ -46,6 +46,10 @@ _DATE_RE = re.compile(
     r"\d{1,2}[-/][A-Za-z]{3,9}[-/]\d{2,4}|\d{1,2}/\d{1,2}/\d{2,4}"
 )
 
+# The BOE's printed USD exchange rate, e.g. ``1 USD=95.3INR`` in the "EXCHANGE
+# RATE" event band. Captures the numeric rate (``95.3``) verbatim (Req 12.3).
+_USD_RATE_RE = re.compile(r"USD\s*=\s*([\d.,]+)\s*INR", re.IGNORECASE)
+
 # A 15-character Indian GSTIN as printed on the BOE (e.g. ``27AAYFG7003K1ZW``).
 # The first two digits are the state code. Used to read the importer's (buyer's)
 # GSTIN so the Tally voucher carries it FROM THE BOE rather than a default.
@@ -158,9 +162,13 @@ class DutyItemRow:
     assessable_value: RawValue  # 29.ASSESS VALUE (Req 3.9)
     bcd_rate: RawValue          # BCD Rate, as a decimal fraction (Req 3.10)
     bcd_amount: RawValue        # BCD Amount (Req 3.10)
-    sws_amount: RawValue        # SWS Amount (Req 3.10 surcharge component)
     igst_rate: RawValue         # IGST Rate, as a decimal fraction (Req 3.11)
     total_duty: RawValue        # 30. TOTAL DUTY (Req 3.12)
+    # Social Welfare Surcharge rate/amount as printed on the BOE (Req 15.1). An
+    # exemption is captured as numeric 0 (NOT missing). Both default to missing
+    # so constructions that predate SWS extraction still work.
+    sws_rate: RawValue = field(default_factory=RawValue.missing)    # SWS Rate (decimal fraction)
+    sws_amount: RawValue = field(default_factory=RawValue.missing)  # SWS Amount
     chcess_amount: RawValue = field(default_factory=RawValue.missing)  # 2.CHCESS (rare)
     # Sum of all non-IGST, non-SWS duty amounts across the Part III duty grids
     # (BCD + CHCESS + CVD + SAD + G.CESS + ADD + CAIDC + NCD + AGGR + ...).
@@ -487,10 +495,13 @@ class PdfParser:
             pages_rows
         )
         invoice_date = self._extract_invoice_date(pages_rows)
+        usd_rate_boe = self._extract_usd_rate(pages_rows)  # Req 12.3
         package_count = self._extract_package_count(pages_rows)
         party_name = self._extract_party_name(pages_rows)
         container_details = self._extract_container_details(pages_rows)
         bl_no, bl_date = self._extract_bl_no_date(pages_rows)  # where present
+        # Part I "C. DUTY SUMMARY" declared document-level totals (Req 10).
+        duty_summary = self._extract_duty_summary(pages_rows)
         # Company name (Excel E1) is the BOE's importer name when present,
         # otherwise the configured fallback.
         extracted_company = self._extract_company_name(pages_rows)
@@ -517,6 +528,7 @@ class PdfParser:
             bl_date=bl_date,
             invoice_amount=invoice_amount,
             invoice_currency=invoice_currency,
+            usd_rate_boe=usd_rate_boe,
             package_count=package_count,
             container_details=container_details,
             buyer_gstin=buyer_gstin,
@@ -525,6 +537,10 @@ class PdfParser:
             buyer_state=buyer_state,
             seller_address=seller_address,
             seller_country=seller_country,
+            declared_bcd=duty_summary["declared_bcd"],
+            declared_sws=duty_summary["declared_sws"],
+            declared_igst=duty_summary["declared_igst"],
+            declared_total_duty=duty_summary["declared_total_duty"],
         )
 
         # Required header fields (Req 2.1-2.8). B/L (2.9) is "where present" and
@@ -556,7 +572,120 @@ class PdfParser:
                     )
                 )
 
+        # Declared Part I duty-summary totals (Req 10.6): each missing/unreadable
+        # value is reported to the User by field name, never inferred.
+        declared: list[tuple[str, RawValue]] = [
+            ("declared_bcd", duty_summary["declared_bcd"]),
+            ("declared_sws", duty_summary["declared_sws"]),
+            ("declared_igst", duty_summary["declared_igst"]),
+            ("declared_total_duty", duty_summary["declared_total_duty"]),
+        ]
+        for name, value in declared:
+            if value.is_missing:
+                flags.append(
+                    ReviewFlag(scope="header", field_name=name, reason="MISSING")
+                )
+            elif value.is_unparseable:
+                flags.append(
+                    ReviewFlag(
+                        scope="header",
+                        field_name=name,
+                        reason="UNPARSEABLE",
+                        raw_text=value.raw_text,
+                    )
+                )
+
         return header, flags
+
+    # ------------------------------------------------------------------
+    # Part I "C. DUTY SUMMARY" declared totals (task 14.1, Req 10)
+    # ------------------------------------------------------------------
+    def _extract_duty_summary(self, pages_rows) -> dict[str, RawValue]:
+        """Capture the four Part I ``C. DUTY SUMMARY`` declared totals (Req 10).
+
+        Returns ``{'declared_bcd', 'declared_sws', 'declared_igst',
+        'declared_total_duty'}`` -> :class:`RawValue`, each
+        :meth:`RawValue.missing` when its label/band is absent (Req 10.5/10.6).
+
+        The duty summary prints two label rows, each with a value row directly
+        beneath (the same rotated margin-label hazard as the Part III grid, so
+        this reads the orientation-aware ``pages_rows`` built by
+        ``_upright_words`` + ``_reconstruct_rows`` -- never naive text):
+
+        - first band  ``1.BCD 2.ACD 3.SWS 4.NCCD 5.ADD 6.CVD 7.IGST ...``
+        - second band ``... 13.HEALTH 14.TOTAL DUTY 15.INT ...``
+
+        Each declared value is read positionally: the label token's centre is
+        used as the anchor and the aligned value on the row beneath is captured
+        via :meth:`_capture` (verbatim + non-destructive numeric parse). A label
+        found but with an unresolvable value yields
+        :meth:`RawValue.unparseable`; a label not found yields
+        :meth:`RawValue.missing` (Req 10.6).
+        """
+        result: dict[str, RawValue] = {
+            "declared_bcd": RawValue.missing(),
+            "declared_sws": RawValue.missing(),
+            "declared_igst": RawValue.missing(),
+            "declared_total_duty": RawValue.missing(),
+        }
+
+        # --- First band: 1.BCD / 3.SWS / 7.IGST -----------------------------
+        def is_summary_band1(row) -> bool:
+            low = [w.text.lower() for w in row]
+            return "1.bcd" in low and "3.sws" in low and "7.igst" in low
+
+        band1 = self._find_label_row(pages_rows, is_summary_band1)
+        if band1 is not None:
+            pi, ri, row = band1
+            rows = pages_rows[pi]
+            band1_labels = (
+                ("declared_bcd", lambda t: t.lower() == "1.bcd"),
+                ("declared_sws", lambda t: t.lower() == "3.sws"),
+                ("declared_igst", lambda t: t.lower() == "7.igst"),
+            )
+            for key, pred in band1_labels:
+                idx = self._word_where(row, pred)
+                if idx is None:
+                    continue
+                anchor = self._center(row[idx])
+                text = self._value_near_anchor(
+                    rows, ri, anchor, max_dist=20.0, max_scan=2
+                )
+                result[key] = self._capture(text, numeric=True)
+
+        # --- Second band: 14.TOTAL DUTY (accepting a bare "TOTAL DUTY") ------
+        def is_total_duty_row(row) -> bool:
+            return self._total_duty_anchor(row) is not None
+
+        band2 = self._find_label_row(pages_rows, is_total_duty_row)
+        if band2 is not None:
+            pi, ri, row = band2
+            rows = pages_rows[pi]
+            anchor = self._total_duty_anchor(row)
+            if anchor is not None:
+                text = self._value_near_anchor(
+                    rows, ri, anchor, max_dist=20.0, max_scan=2
+                )
+                result["declared_total_duty"] = self._capture(text, numeric=True)
+
+        return result
+
+    def _total_duty_anchor(self, row) -> float | None:
+        """Horizontal anchor of the ``14.TOTAL DUTY`` label in ``row``, or ``None``.
+
+        Accepts the split two-token form (``14.TOTAL`` + ``DUTY`` or the bare
+        ``TOTAL`` + ``DUTY``) as well as a single joined token; the anchor spans
+        the whole label so the value printed beneath the two words aligns to its
+        centre rather than to just the first token.
+        """
+        for i, w in enumerate(row):
+            t = w.text.lower()
+            if t in ("14.total", "total"):
+                if i + 1 < len(row) and row[i + 1].text.lower() == "duty":
+                    return (w.x0 + row[i + 1].x1) / 2.0
+            elif t in ("14.totalduty", "totalduty"):
+                return self._center(w)
+        return None
 
     # ------------------------------------------------------------------
     # Positional search helpers
@@ -728,6 +857,25 @@ class PdfParser:
                 c = self._center(w)
                 if x_lo <= c <= x_hi and _DATE_RE.fullmatch(w.text):
                     return self._capture(w.text)
+        return RawValue.missing()
+
+    def _extract_usd_rate(self, pages_rows) -> RawValue:
+        """USD exchange rate printed on the BOE (Req 12.3).
+
+        Reads the "EXCHANGE RATE" event band, where the rate is printed as e.g.
+        ``1 USD=95.3INR``. The upright-word tokenizer keeps ``USD=95.3INR`` as a
+        single token, so each row's text is joined and matched positionally with
+        :data:`_USD_RATE_RE`; the numeric rate (``95.3``) is captured verbatim
+        via :meth:`_capture`. Returns :meth:`RawValue.missing` when the BOE does
+        not print a USD rate, so the Excel_Generator falls back to the
+        User-supplied rate (Req 12.4). Never inferred when absent.
+        """
+        for rows in pages_rows:
+            for row in rows:
+                text = " ".join(w.text for w in row)
+                m = _USD_RATE_RE.search(text)
+                if m:
+                    return self._capture(m.group(1), numeric=True)
         return RawValue.missing()
 
     def _extract_package_count(self, pages_rows) -> RawValue:
@@ -1316,7 +1464,7 @@ class PdfParser:
         serial = int(serial_text)
 
         assessable, total_duty = self._duty_assess_total(block)
-        bcd_rate, bcd_amount, sws_amount, igst_rate = self._duty_grid(block)
+        bcd_rate, bcd_amount, sws_rate, sws_amount, igst_rate = self._duty_grid(block)
         chcess_amount = self._chcess_amount(block)
         other_duties_total = self._other_duties_total(block)
 
@@ -1325,6 +1473,7 @@ class PdfParser:
             assessable_value=assessable,
             bcd_rate=bcd_rate,
             bcd_amount=bcd_amount,
+            sws_rate=sws_rate,
             sws_amount=sws_amount,
             igst_rate=igst_rate,
             total_duty=total_duty,
@@ -1419,26 +1568,36 @@ class PdfParser:
                 return assess, total
         return RawValue.missing(), RawValue.missing()
 
-    def _duty_grid(self, block) -> tuple[RawValue, RawValue, RawValue, RawValue]:
-        """BCD rate/amount, SWS amount and IGST rate from the first duty grid.
+    def _duty_grid(
+        self, block
+    ) -> tuple[RawValue, RawValue, RawValue, RawValue, RawValue]:
+        """BCD rate/amount, SWS rate/amount and IGST rate from the first duty grid.
 
         The grid carries one ``Rate`` and one ``Amount`` sub-row beneath a header
         of duty-type columns (``BCD``, ``3.SWS``, ``5.IGST``, ...). Values are
-        read by the column window each label defines. Returns missing values if
-        the grid or its sub-rows cannot be located.
+        read by the column window each label defines. The SWS rate is captured as
+        a decimal fraction (printed ``10`` -> ``0.10``) and its amount verbatim;
+        an exemption prints as numeric ``0`` and is captured as ``0`` (not
+        missing) per Req 15.1. Returns missing values if the grid or its sub-rows
+        cannot be located.
         """
         di = self._find_duty_grid_header(block)
         if di is None:
-            return (RawValue.missing(),) * 4  # type: ignore[return-value]
+            return (RawValue.missing(),) * 5  # type: ignore[return-value]
         cols = self._duty_grid_cols(block[di])
         if cols is None:
-            return (RawValue.missing(),) * 4  # type: ignore[return-value]
+            return (RawValue.missing(),) * 5  # type: ignore[return-value]
 
         rate_row = self._first_row_starting(block, di + 1, "rate")
         amount_row = self._first_row_starting(block, di + 1, "amount")
 
         bcd_rate = (
             self._capture_rate(self._token_in_range(rate_row, *cols.bcd))
+            if rate_row is not None
+            else RawValue.missing()
+        )
+        sws_rate = (
+            self._capture_rate(self._token_in_range(rate_row, *cols.sws))
             if rate_row is not None
             else RawValue.missing()
         )
@@ -1457,7 +1616,7 @@ class PdfParser:
             if amount_row is not None
             else RawValue.missing()
         )
-        return bcd_rate, bcd_amount, sws_amount, igst_rate
+        return bcd_rate, bcd_amount, sws_rate, sws_amount, igst_rate
 
     @staticmethod
     def _find_duty_grid_header(block) -> int | None:
@@ -1581,6 +1740,8 @@ class PdfParser:
             )
             bcd_rate = duty_row.bcd_rate if duty_row else RawValue.missing()
             bcd_amount = duty_row.bcd_amount if duty_row else RawValue.missing()
+            sws_rate = duty_row.sws_rate if duty_row else RawValue.missing()
+            sws_amount = duty_row.sws_amount if duty_row else RawValue.missing()
             igst_rate = duty_row.igst_rate if duty_row else RawValue.missing()
             total_duty = duty_row.total_duty if duty_row else RawValue.missing()
             chcess_amount = (
@@ -1601,6 +1762,8 @@ class PdfParser:
                     assessable_value=assessable_value,
                     bcd_rate=bcd_rate,
                     bcd_amount=bcd_amount,
+                    sws_rate=sws_rate,
+                    sws_amount=sws_amount,
                     igst_rate=igst_rate,
                     total_duty=total_duty,
                     chcess_amount=chcess_amount,

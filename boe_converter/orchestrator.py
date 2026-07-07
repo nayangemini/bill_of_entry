@@ -45,10 +45,13 @@ from boe_converter.calculator import ValueCalculator
 from boe_converter.excel_writer import ExcelGenerator
 from boe_converter.invoice_parser import InvoicePackingListParser
 from boe_converter.models import (
+    GRAND_TOTAL_TOLERANCE_INR,
     ComputedDocument,
     ConversionSummary,
     Discrepancy,
     ExtractedDocument,
+    GrandTotalCheck,
+    GrandTotalVerification,
     RawValue,
     ReviewFlag,
     ReviewFlagSet,
@@ -212,8 +215,15 @@ class ConversionOrchestrator:
             if invoice_raw:
                 extracted = self._attach_cartons(extracted, invoice_raw)
             computed = self.calculator.compute(extracted, usd_rate)
+            # Grand-total verification (Req 11) is computed *before* the
+            # workbook is built so its MISMATCH columns can be red-filled by
+            # generate(); the same GrandTotalVerification is reused for the
+            # summary discrepancies below (computed once).
+            verification = self._verify_grand_totals(extracted, computed)
             workbook_bytes = self.generator.generate(
-                computed, ReviewFlagSet(computed.flags)
+                computed,
+                ReviewFlagSet(computed.flags),
+                grand_total_check=verification,
             )
         except Exception:
             # The document was recognized as a BOE, so this is a
@@ -242,7 +252,9 @@ class ConversionOrchestrator:
 
         # 4) Cross-checks + summary (workbook is retained regardless; these are
         #    anomalies surfaced to the User, never silent drops).
-        discrepancies, output_complete = self._cross_check(extracted, computed)
+        discrepancies, output_complete = self._cross_check(
+            extracted, computed, verification
+        )
         summary = self._build_summary(extracted, computed, discrepancies)
 
         # 5) Atomic output: only now -- after a fully successful build -- issue
@@ -327,14 +339,22 @@ class ConversionOrchestrator:
     # Cross-checks (declared vs extracted/computed)
     # ------------------------------------------------------------------
     def _cross_check(
-        self, extracted: ExtractedDocument, computed: ComputedDocument
+        self,
+        extracted: ExtractedDocument,
+        computed: ComputedDocument,
+        verification: GrandTotalVerification | None = None,
     ) -> tuple[list[Discrepancy], bool]:
-        """Run the three cross-checks; return discrepancies and completeness.
+        """Run the four cross-checks; return discrepancies and completeness.
 
         ``output_complete`` is ``False`` only when an item-count mismatch means
-        the output must not be presented as complete (Req 3.3). The invoice-total
-        and recompute checks never affect completeness (the workbook is retained;
-        Req 7.6/9.4).
+        the output must not be presented as complete (Req 3.3). The invoice-total,
+        recompute, and grand-total checks never affect completeness (the workbook
+        is retained and downloadable; Req 7.6/9.4/11.8).
+
+        The ``verification`` is the ``GrandTotalVerification`` already computed in
+        :meth:`convert` (so the fills and the summary discrepancies share one
+        result). When ``None`` it is computed here so the cross-checks stay
+        self-contained.
         """
         discrepancies: list[Discrepancy] = []
         output_complete = True
@@ -349,6 +369,12 @@ class ConversionOrchestrator:
             discrepancies.append(invoice_total_disc)
 
         discrepancies.extend(self._check_recompute(computed))
+
+        # Req 11.6/11.9: grand-total mismatches surface in the summary but never
+        # affect output_complete (Req 11.8: the workbook is always retained).
+        if verification is None:
+            verification = self._verify_grand_totals(extracted, computed)
+        discrepancies.extend(self._check_grand_totals(verification))
 
         return discrepancies, output_complete
 
@@ -438,6 +464,126 @@ class ConversionOrchestrator:
                         ),
                         expected=extracted_duty,
                         actual=recomputed_duty,
+                    )
+                )
+        return discrepancies
+
+    # ------------------------------------------------------------------
+    # Grand-total verification (Req 11)
+    # ------------------------------------------------------------------
+    def _verify_grand_totals(
+        self, extracted: ExtractedDocument, computed: ComputedDocument
+    ) -> GrandTotalVerification:
+        """Req 11.1/11.2/11.3: verify the three Totals_Row grand totals vs the BOE.
+
+        Compares each Excel grand total against the matching declared Part I
+        duty-summary value printed in the BOE header, producing one
+        :class:`GrandTotalCheck` per column:
+
+        - **P** -- ``Totals.total_customs_duty`` vs ``declared_bcd + declared_sws``
+          (both parts must be present; if either is missing/unreadable the column
+          is ``UNVERIFIED``).
+        - **Q** -- ``Totals.total_igst`` vs ``declared_igst``.
+        - **S** -- ``Totals.total_customs_duty + Totals.total_igst`` vs
+          ``declared_total_duty``.
+
+        Each declared value is read via :func:`_as_number`, so a missing or
+        unreadable field yields ``declared=None`` and ``status="UNVERIFIED"``
+        (Req 11.7 -- could-not-verify, no fill). Otherwise a difference greater
+        than ``GRAND_TOTAL_TOLERANCE_INR`` (1.00 INR) is a ``MISMATCH``
+        (Req 11.4); within tolerance is a ``MATCH`` (Req 11.5).
+        """
+        totals = computed.totals
+        header = extracted.header
+
+        # Column P: BCD + SWS. Both parts are required; if either is
+        # missing/unreadable the whole declared BCD+SWS is treated as absent.
+        declared_bcd = _as_number(header.declared_bcd)
+        declared_sws = _as_number(header.declared_sws)
+        if declared_bcd is None or declared_sws is None:
+            declared_p: float | None = None
+        else:
+            declared_p = declared_bcd + declared_sws
+
+        checks = [
+            self._grand_total_check("P", totals.total_customs_duty, declared_p),
+            self._grand_total_check(
+                "Q", totals.total_igst, _as_number(header.declared_igst)
+            ),
+            self._grand_total_check(
+                "S",
+                totals.total_customs_duty + totals.total_igst,
+                _as_number(header.declared_total_duty),
+            ),
+        ]
+        return GrandTotalVerification(checks=checks)
+
+    @staticmethod
+    def _grand_total_check(
+        column: str, excel_total: float, declared: float | None
+    ) -> GrandTotalCheck:
+        """Classify one column as MATCH/MISMATCH/UNVERIFIED (Req 11.4/11.5/11.7)."""
+        if declared is None:
+            status = "UNVERIFIED"
+        elif abs(excel_total - declared) > GRAND_TOTAL_TOLERANCE_INR:
+            status = "MISMATCH"
+        else:
+            status = "MATCH"
+        return GrandTotalCheck(
+            column=column,
+            declared=declared,
+            excel_total=excel_total,
+            status=status,
+        )
+
+    def _check_grand_totals(
+        self, verification: GrandTotalVerification
+    ) -> list[Discrepancy]:
+        """Req 11.6/11.9: emit a ``GRAND_TOTAL`` discrepancy per MISMATCH column.
+
+        Each MISMATCH yields a :class:`Discrepancy` naming the affected Excel
+        column (P/Q/S) and carrying the declared value as ``expected`` and the
+        Excel grand total as ``actual`` so both surface in the
+        ``ConversionSummary`` (Req 11.9). ``UNVERIFIED`` columns represent a
+        could-not-verify condition (Req 11.7): they emit an informational
+        ``GRAND_TOTAL`` discrepancy with ``expected=None`` but never a mismatch.
+        ``MATCH`` columns produce nothing. This check never affects
+        ``output_complete`` (Req 11.8).
+        """
+        column_label = {
+            "P": "BCD+SWS",
+            "Q": "IGST",
+            "S": "total duty",
+        }
+        discrepancies: list[Discrepancy] = []
+        for check in verification.checks:
+            if check.status == "MISMATCH":
+                label = column_label[check.column]
+                discrepancies.append(
+                    Discrepancy(
+                        kind="GRAND_TOTAL",
+                        message=(
+                            f"Excel column {check.column} grand total "
+                            f"{check.excel_total} differs from the BOE declared "
+                            f"{label} {check.declared}."
+                        ),
+                        expected=check.declared,
+                        actual=check.excel_total,
+                    )
+                )
+            elif check.status == "UNVERIFIED":
+                label = column_label[check.column]
+                discrepancies.append(
+                    Discrepancy(
+                        kind="GRAND_TOTAL",
+                        message=(
+                            f"Excel column {check.column} grand total "
+                            f"{check.excel_total} could not be verified against "
+                            f"the BOE declared {label} (value missing or "
+                            f"unreadable)."
+                        ),
+                        expected=None,
+                        actual=check.excel_total,
                     )
                 )
         return discrepancies

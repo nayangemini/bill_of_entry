@@ -73,7 +73,7 @@ class _FakeParser:
 class _FakeGenerator:
     """Excel generator stub: returns fixed bytes so a workbook is retained."""
 
-    def generate(self, computed, flags) -> bytes:
+    def generate(self, computed, flags, grand_total_check=None) -> bytes:
         return b"xlsx"
 
 
