@@ -10,18 +10,21 @@ Normative formulas (design.md -> Computation model):
 
     amount_usd             = unit_price * qty
     purchase_inr           = amount_usd * usd_rate
-    sws_amount             = bcd_amount * 0.10
-    total_customs_duty     = bcd_amount + sws_amount
+    sws_amount             = BOE-declared SWS (amount, or cust_aidc * declared
+                             rate); only when neither is declared does it fall
+                             back to cust_aidc * 0.10 (Req 15)
+    total_customs_duty     = cust_aidc + sws_amount
     igst_amount            = igst_rate * (assessable_value + total_customs_duty)
     combined_duty          = total_customs_duty + igst_amount
     land_cost_excl_gst     = purchase_inr + total_customs_duty
     land_cost_incl_gst     = land_cost_excl_gst + igst_amount
     purchase_rate_per_unit = land_cost_excl_gst / qty   (= 0 when qty == 0)
-    pcs                    = qty * 12   (only when unit trimmed/upper == "DOZ")
+    pcs                    = qty * pcs_factor(unit)   (DOZ=12, GRS=144, THD=1000)
 """
 
 from __future__ import annotations
 
+from boe_converter import units
 from boe_converter.models import (
     ComputedDocument,
     ComputedLine,
@@ -120,7 +123,10 @@ def _as_raw_value(pkg_count: RawValue | int | float | str | None) -> RawValue:
 class ValueCalculator:
     """Pure function: same inputs always produce the same outputs, no I/O."""
 
-    SWS_RATE = 0.10  # Social Welfare Surcharge fixed at 10% of BCD (Req 6.3)
+    # Fallback Social Welfare Surcharge rate, used ONLY when the BOE declares
+    # neither an SWS amount nor an SWS rate for a line (Req 15.5). The normal
+    # path uses the BOE-declared value; see :meth:`_resolve_sws`.
+    SWS_RATE = 0.10
 
     def compute_line(self, item: LineItem, usd_rate: float) -> ComputedLine:
         """Compute per-line derived values per Requirement 6 / 5.8.
@@ -185,7 +191,20 @@ class ValueCalculator:
             cust_aidc = bcd_amount + (chcess_amount or 0.0)
         else:
             cust_aidc = None
-        sws_amount = cust_aidc * self.SWS_RATE if cust_aidc is not None else None
+        # Social Welfare Surcharge is driven by the value the BOE actually
+        # declares, NOT a fixed 10% (Req 15). An exemption declared as 0 is
+        # honoured as 0; only when the BOE declares neither an SWS amount nor an
+        # SWS rate do we fall back to 10% and flag the line for review.
+        sws_amount, sws_fallback = self._resolve_sws(item, cust_aidc)
+        if sws_fallback:
+            flags.append(
+                ReviewFlag(
+                    scope="line_item",
+                    field_name="sws_amount",
+                    reason="MISSING",
+                    item_serial=item.item_serial,
+                )
+            )
         total_customs_duty = (
             cust_aidc + sws_amount
             if cust_aidc is not None and sws_amount is not None
@@ -214,6 +233,7 @@ class ValueCalculator:
             else None
         )
         purchase_rate_per_unit = self._purchase_rate_per_unit(qty, land_cost_excl_gst)
+        pcs_factor = units.pcs_factor(_unit_text(item.unit))
         pcs = self._pcs(item.unit, qty)
 
         line = ComputedLine(
@@ -228,9 +248,54 @@ class ValueCalculator:
             land_cost_excl_gst=land_cost_excl_gst,
             land_cost_incl_gst=land_cost_incl_gst,
             pcs=pcs,
+            pcs_factor=pcs_factor,
             purchase_rate_per_unit=purchase_rate_per_unit,
         )
         return line, flags
+
+    def _resolve_sws(
+        self, item: LineItem, cust_aidc: float | None
+    ) -> tuple[float | None, bool]:
+        """Resolve the per-line SWS amount from the BOE (Req 15.1-15.5).
+
+        Returns ``(sws_amount, fallback_used)`` at full floating-point precision
+        (no rounding):
+
+        - An extracted per-line SWS *rate* drives
+          ``sws_amount = cust_aidc * sws_rate`` at full precision (Req 15.2/15.3,
+          16.1). This is preferred over the BOE-printed SWS *amount* because the
+          latter is rounded on the BOE (e.g. a base of 216.87 prints ``21.7``,
+          not the exact ``21.687``); consuming that pre-rounded amount would
+          inject precision loss into IGST and every downstream duty/land-cost
+          value. A declared rate of ``0`` (exemption) yields ``0`` (Req 15.3).
+        - Else an extracted per-line SWS *amount* (including a declared ``0``
+          exemption) is used directly (Req 15.2/15.4) -- e.g. when the BOE prints
+          an amount but no resolvable rate, or the customs-duty base is missing.
+        - Else there is nothing declared: fall back to ``cust_aidc * 0.10`` and
+          signal a review flag (Req 15.5). ``fallback_used`` is ``True`` only in
+          this branch.
+
+        When the customs-duty base (``cust_aidc``) is itself missing, a
+        rate-based or fallback amount cannot be computed; the declared amount is
+        used if present, otherwise ``None`` is returned (written blank
+        downstream).
+        """
+        # Prefer the declared SWS *rate* computed on the full-precision customs
+        # base over the BOE's pre-rounded printed amount (Req 16.1).
+        sws_rate_extracted = _as_number(getattr(item, "sws_rate", None))
+        if sws_rate_extracted is not None and cust_aidc is not None:
+            return cust_aidc * sws_rate_extracted, False
+
+        # Fall back to the declared amount (rate absent, or no base to apply it
+        # to); a declared ``0`` exemption is honoured as ``0`` (Req 15.4).
+        sws_amount_extracted = _as_number(getattr(item, "sws_amount", None))
+        if sws_amount_extracted is not None:
+            return sws_amount_extracted, False
+
+        # Nothing usable declared -> fall back to the historical 10% and flag.
+        if cust_aidc is None:
+            return None, True
+        return cust_aidc * self.SWS_RATE, True
 
     @staticmethod
     def _purchase_rate_per_unit(
@@ -248,14 +313,18 @@ class ValueCalculator:
 
     @staticmethod
     def _pcs(unit: RawValue | None, qty: float | None) -> float | None:
-        """qty * 12 only when the unit trimmed/upper-cased == "DOZ" (Req 5.8/5.9)."""
+        """qty * factor for piece-equivalent units (DOZ/GRS/THD), else None.
 
-        text = _unit_text(unit)
-        if text is None or text.strip().upper() != "DOZ":
+        The pieces-per-unit factor comes from the shared ``units`` table
+        (:func:`boe_converter.units.pcs_factor`) so the Excel ``pcs`` column and
+        the JSON/Tally piece conversion stay in lockstep (Req 14.6). A unit that
+        is not piece-equivalent, or a missing quantity, yields ``None`` (written
+        blank downstream). Full precision is preserved (no rounding)."""
+
+        factor = units.pcs_factor(_unit_text(unit))
+        if factor is None or qty is None:
             return None
-        if qty is None:
-            return None
-        return qty * 12
+        return qty * factor
 
     def _collect_flags(
         self,

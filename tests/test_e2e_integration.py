@@ -263,7 +263,7 @@ class _RaisingGenerator:
     the orchestrator's atomic-output guarantee (Req 1.7).
     """
 
-    def generate(self, computed, flags):  # noqa: ANN001 - test double
+    def generate(self, computed, flags, grand_total_check=None):  # noqa: ANN001 - test double
         raise RuntimeError("injected post-recognition generation failure")
 
 

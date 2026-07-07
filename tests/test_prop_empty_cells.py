@@ -154,8 +154,9 @@ _HEADER = st.builds(
 
 
 # Header_Block value cells that have no BOE/configuration source (Req 4.8): the
-# label is written but the value cell must always stay empty.
-_HEADER_NO_SOURCE_VALUE_CELLS = ("G3", "E7", "G7", "E8", "G8")
+# label is written but the value cell must always stay empty. (G3 "USD Amt" is
+# no longer no-source: Req 12.2 sources it from the BOE USD invoice amount.)
+_HEADER_NO_SOURCE_VALUE_CELLS = ("E7", "G7", "E8", "G8")
 
 # Item_Table columns left empty for every data row (Req 8.6 / Milestone-1
 # Manual/External): PARTY NAME (B), BILLING AMOUNT (C), AS PER TALLY NAME (D),

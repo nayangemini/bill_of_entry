@@ -233,6 +233,13 @@ class HeaderBlock:
     invoice_currency: RawValue    # Req 2.5
     package_count: RawValue       # PKG/CTN total e.g. 1357 (Req 2.6, 7.5)
     container_details: RawValue   # container number + count (Req 2.8)
+    # --- Part I "C. DUTY SUMMARY" declared document-level totals (Req 10) ---
+    # Captured verbatim (numeric) from the BOE duty summary; each defaults to
+    # RawValue.missing() and is never inferred when absent (Req 10.5/10.6).
+    declared_bcd: RawValue = field(default_factory=RawValue.missing)         # Req 10.3
+    declared_sws: RawValue = field(default_factory=RawValue.missing)         # Req 10.4
+    declared_igst: RawValue = field(default_factory=RawValue.missing)        # Req 10.2
+    declared_total_duty: RawValue = field(default_factory=RawValue.missing)  # Req 10.1
 
 @dataclass(frozen=True)
 class LineItem:
@@ -305,11 +312,16 @@ class ReviewFlag:
 
 @dataclass(frozen=True)
 class Discrepancy:
-    kind: Literal["ITEM_COUNT", "INVOICE_TOTAL", "RECOMPUTE"]
+    kind: Literal["ITEM_COUNT", "INVOICE_TOTAL", "RECOMPUTE", "GRAND_TOTAL"]
     message: str
     expected: float | int | str | None   # declared/extracted value
     actual: float | int | str | None     # computed/recomputed value
 ```
+
+> **Extension (Requirement 11):** the `Discrepancy.kind` `Literal` gains a new value
+> `"GRAND_TOTAL"` for the duty-summary grand-total mismatches. Such a discrepancy carries
+> `expected = <BOE declared value>`, `actual = <Excel grand total>`, and a `message` naming the
+> affected Excel column (P, Q, or S). No other field changes.
 
 ### Computation model (normative formulas, Requirement 6/7)
 
@@ -388,6 +400,177 @@ and headers, the C&F detail block (B72–B86), and `CLEARANCE AND FORWARDING INV
 > BOE with a different item count, items still begin at row 13 with no blank rows (Req 5.1); the totals
 > row position handling for non-45-item documents is noted as an open layout question (see Open Questions
 > in requirements) and defaults to summing the actual populated data range.
+
+## Grand-Total Verification (Requirements 10 & 11)
+
+This section extends the Milestone 1 design to add **document-level duty-summary extraction** (Req 10)
+and **grand-total verification with red-fill highlighting** (Req 11). It builds on the existing
+components without altering their Milestone 1 behavior: the parser gains one extraction stage, the
+orchestrator gains one cross-check, and the Excel_Generator gains conditional cell fills on the
+Totals_Row. All other flows are unchanged.
+
+### Feature grounding from the reference files
+
+The BOE Part I prints a `C. DUTY SUMMARY` band listing document-level declared totals. In the primary
+reference PDF (`205090022062026INNSA1BE0230620261842.pdf`) the relevant values are:
+
+| Duty-summary label | Declared value |
+|---|---|
+| `1.BCD` | `184250.2` |
+| `3.SWS` | `18810.2` |
+| `7.IGST` | `258391` |
+| `14.TOTAL DUTY` / `TOTAL DUTY` | `465302` |
+
+A second reference BOE (`229411903072026INNSA1BE0040720261315.pdf`) is used to confirm the band's label
+set and column geometry generalise beyond the single sample. Like the Part III duty grid, the duty
+summary is subject to the **rotated margin-label hazard**, so it must be read with the existing
+orientation-aware, coordinate-based approach — never naive `extract_text()`.
+
+### Architecture (extended flow)
+
+```mermaid
+flowchart TD
+    PP[PDF_Parser\n_extract_header + _extract_duty_summary] -->|ExtractedDocument\n+ Declared_* totals| VC[Value_Calculator]
+    VC -->|ComputedDocument| ORC[Conversion Orchestrator]
+    ORC --> GTV[_verify_grand_totals\nP vs BCD+SWS, Q vs IGST, S vs TOTAL DUTY]
+    GTV -->|GrandTotalVerification\n(highlight cols + discrepancies)| EG[Excel_Generator.generate\ndoc, flags, grand_total_check]
+    EG -->|workbook bytes\n(red fills on mismatched cells)| ORC
+    GTV -. GRAND_TOTAL Discrepancies .-> SUM[ConversionSummary]
+```
+
+> **Ordering change:** in Milestone 1 `generate()` runs before `_cross_check()`. Because the red fill
+> depends on the verification result, the orchestrator MUST compute the grand-total verification
+> **before** calling `generate()` and pass the result in. The verification's discrepancies are then
+> merged into the cross-check output for the summary. All other cross-checks are unchanged.
+
+### Data model additions
+
+Beyond the four `Declared_*` fields added to `HeaderBlock` (see Data Models) and the new
+`Discrepancy.kind` value `"GRAND_TOTAL"`, the feature introduces a small verification result object that
+the orchestrator produces and the Excel_Generator consumes:
+
+```python
+GRAND_TOTAL_TOLERANCE_INR = 1.00  # Req 11.4/11.5
+
+@dataclass(frozen=True)
+class GrandTotalCheck:
+    """Result of verifying one Totals_Row grand total against the BOE (Req 11)."""
+    column: Literal["P", "Q", "S"]     # affected Excel Totals_Row column
+    declared: float | None             # BOE declared value; None if missing/unreadable
+    excel_total: float                 # the grand total written to the Totals_Row
+    status: Literal["MATCH", "MISMATCH", "UNVERIFIED"]
+
+@dataclass(frozen=True)
+class GrandTotalVerification:
+    """The three column checks plus the derived highlight set."""
+    checks: list[GrandTotalCheck]
+
+    @property
+    def highlight_columns(self) -> set[str]:
+        """Excel column letters whose cell must be red-filled (Req 11.4)."""
+        return {c.column for c in self.checks if c.status == "MISMATCH"}
+```
+
+- `status == "MISMATCH"` when the declared value is present and `abs(excel_total - declared) > 1.00`.
+- `status == "MATCH"` when the declared value is present and `abs(excel_total - declared) <= 1.00`.
+- `status == "UNVERIFIED"` when a required declared value is missing/unreadable (for column P this
+  includes a missing `Declared_BCD` **or** `Declared_SWS`) (Req 11.7).
+
+### PDF_Parser: `_extract_duty_summary`
+
+A new internal stage mirrors the existing `_duty_grid` / `_duty_assess_total` pattern:
+
+```python
+def _extract_duty_summary(self, pages) -> dict[str, RawValue]:
+    """Locate the Part I 'C. DUTY SUMMARY' band and capture the four declared
+    totals. Returns {'declared_bcd', 'declared_sws', 'declared_igst',
+    'declared_total_duty'} -> RawValue, each RawValue.missing() when absent."""
+```
+
+Extraction approach (reusing existing primitives):
+1. Reconstruct rows from `_upright_words(page)` so rotated margin labels are excluded.
+2. Locate the `C. DUTY SUMMARY` band and its label tokens: `1.BCD`, `3.SWS`, `7.IGST`, and
+   `14.TOTAL DUTY` (accepting the bare `TOTAL DUTY` variant), using the same `_x0_of` /
+   positional column-window reading used by `_duty_grid_cols` to pick the numeric value printed for
+   each label.
+3. Capture each value with `self._capture(raw_text, numeric=True)` so it is stored verbatim with a
+   non-destructive numeric parse (Req 10.5). A label found but with unresolvable characters yields
+   `RawValue.unparseable(...)`; a label not found yields `RawValue.missing()` (Req 10.6).
+
+Wire into `_extract_header` so the four `RawValue`s land on `HeaderBlock.declared_bcd` /
+`declared_sws` / `declared_igst` / `declared_total_duty`. Each missing/unparseable declared value emits a
+`ReviewFlag(scope="header", field_name="declared_*", reason="MISSING"|"UNPARSEABLE")` and is reported to
+the User by field name (Req 10.6), consistent with the existing header-field anomaly handling.
+
+### Conversion Orchestrator: `_verify_grand_totals`
+
+The orchestrator computes the three comparisons from the already-computed `Totals` and the
+`HeaderBlock` declared values, producing a `GrandTotalVerification`:
+
+| Excel column | Excel grand total (`actual`) | BOE declared value (`expected`) |
+|---|---|---|
+| P (`COL_TOTAL_CUSTOM_DUTY`) | `Totals.total_customs_duty` | `declared_bcd + declared_sws` |
+| Q (`COL_GST`) | `Totals.total_igst` | `declared_igst` |
+| S (`COL_TOTAL_CUSTOM_DUTY_2`) | `Totals.total_customs_duty + Totals.total_igst` | `declared_total_duty` |
+
+For each column:
+- If a required declared value is missing/unreadable → `GrandTotalCheck(status="UNVERIFIED")`; the
+  orchestrator reports "the column &lt;X&gt; grand total could not be verified against the BOE" and the
+  cell is **not** filled (Req 11.7).
+- Else if `abs(actual - expected) > 1.00` → `status="MISMATCH"`; emit
+  `Discrepancy(kind="GRAND_TOTAL", expected=declared, actual=excel_total, message=…names column…)`
+  (Req 11.6).
+- Else → `status="MATCH"`; no discrepancy, no fill (Req 11.5).
+
+This runs inside the existing `_cross_check` flow (a new `_check_grand_totals(extracted, computed)`
+helper appended alongside `_check_item_count` / `_check_invoice_total` / `_check_recompute`). Its
+`GRAND_TOTAL` discrepancies are appended to the returned list so they surface in `ConversionSummary`
+(Req 11.9), and it never affects `output_complete` (the workbook is always retained and downloadable,
+Req 11.8). Because `generate()` needs `highlight_columns`, the orchestrator computes the verification
+before building the workbook and threads the `GrandTotalVerification` into `generate()`.
+
+### Excel_Generator: red-fill highlighting
+
+`generate()` / `build_workbook()` gain an optional parameter so the highlight decision is passed in
+without breaking the atomic in-memory build:
+
+```python
+def generate(
+    self, doc: ComputedDocument, flags: ReviewFlagSet,
+    grand_total_check: GrandTotalVerification | None = None,
+) -> bytes: ...
+```
+
+Within `_write_totals_row` (or a dedicated `_apply_grand_total_highlights(ws, totals_row, columns)`
+called immediately after the totals are written), for each column letter in
+`grand_total_check.highlight_columns`, apply a solid red fill to that Totals_Row cell:
+
+```python
+RED_FILL = PatternFill(fill_type="solid", fgColor="FFFF0000", start_color="FFFF0000")
+_HIGHLIGHT_COL_INDEX = {"P": COL_TOTAL_CUSTOM_DUTY,   # 16
+                        "Q": COL_GST,                 # 17
+                        "S": COL_TOTAL_CUSTOM_DUTY_2}  # 19
+# for a mismatched column: ws.cell(row=totals_row, column=_HIGHLIGHT_COL_INDEX[c]).fill = RED_FILL
+```
+
+- Only columns in `highlight_columns` are filled; MATCH and UNVERIFIED columns keep their existing
+  (unfilled) styling (Req 11.4/11.5/11.7).
+- The fill targets the Totals_Row (row 61 by default, `totals_row` when shifted on overflow) at column
+  indices P=16, Q=17, S=19 — the existing `COL_*` constants.
+- When `grand_total_check is None` (e.g. verification not run), no fill is applied — Milestone 1
+  behavior is preserved.
+
+### Target Excel cell map — Totals_Row notes (extended)
+
+The Totals_Row (row 61) columns `P`, `Q`, `S` are the verified grand totals:
+
+| Totals_Row cell | Grand total | Verified against (Req 11) | Red fill when |
+|---|---|---|---|
+| P61 (`COL_TOTAL_CUSTOM_DUTY`, 16) | `Totals.total_customs_duty` | `Declared_BCD + Declared_SWS` | mismatch > 1.00 INR |
+| Q61 (`COL_GST`, 17) | `Totals.total_igst` | `Declared_IGST` | mismatch > 1.00 INR |
+| S61 (`COL_TOTAL_CUSTOM_DUTY_2`, 19) | `Totals.total_customs_duty + Totals.total_igst` | `Declared_TOTAL_DUTY` | mismatch > 1.00 INR |
+
+All other Totals_Row columns are written exactly as in Milestone 1 and are never red-filled.
 
 <!-- PBT applicability: The Value_Calculator and line-item assembly are pure, input-driven logic with
 universal invariants (completeness, ordering, arithmetic relationships, round-trips). PBT IS applicable.
@@ -548,6 +731,35 @@ conversion could not be completed and no partial or complete workbook is made av
 
 **Validates: Requirements 1.7**
 
+### Property 18: Grand-total mismatch beyond tolerance is highlighted red and reported; within tolerance is not
+
+*For any* declared duty-summary values and Excel grand totals, for each verified column — P
+(`total_customs_duty` vs `Declared_BCD + Declared_SWS`), Q (`total_igst` vs `Declared_IGST`), and S
+(`total_customs_duty + total_igst` vs `Declared_TOTAL_DUTY`) — when the declared value is present and the
+grand total differs from it by more than 1.00 INR, that Totals_Row cell is written with a solid red fill
+(ARGB `FFFF0000`) and a `Discrepancy` of kind `GRAND_TOTAL` is produced carrying the affected column, the
+Excel grand total, and the declared value; and when the difference is 1.00 INR or less, that cell is
+written with no red fill and no such discrepancy is produced.
+
+**Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5, 11.6**
+
+### Property 19: Missing declared value yields could-not-verify with no fill
+
+*For any* verified column whose required declared value is absent or unreadable — including a missing
+`Declared_BCD` or `Declared_SWS` for the column P comparison — the converter reports that that column's
+grand total could not be verified against the BOE, that Totals_Row cell is written with no red fill, and
+no `GRAND_TOTAL` mismatch discrepancy is produced for that column.
+
+**Validates: Requirements 10.6, 11.7**
+
+### Property 20: Grand-total mismatches are retained and surfaced in the summary
+
+*For any* document that produces one or more grand-total mismatches, a downloadable workbook is still
+produced (retained and made available), and every `GRAND_TOTAL` `Discrepancy` produced by the
+verification appears in the `ConversionSummary` reported to the User.
+
+**Validates: Requirements 11.8, 11.9**
+
 ## Error Handling
 
 Errors are partitioned into **rejections** (before/at validation — no output, clear user message) and
@@ -579,6 +791,10 @@ guaranteeing atomicity (Property 17).
 | Computed invoice total vs declared > 0.01 USD | Emit `Discrepancy(INVOICE_TOTAL, …)`, retain workbook | 7.6 |
 | Declared invoice total absent/unreadable | Report "computed invoice total could not be verified against the BOE" | 7.7 |
 | Extracted vs recomputed value diff > 0.01 | Emit `Discrepancy(RECOMPUTE, expected=extracted, actual=recomputed)` | 9.4 |
+| Missing/unreadable declared duty-summary total | Record `RawValue(is_missing=True)`/`unparseable`, emit `ReviewFlag(header, "declared_*", MISSING\|UNPARSEABLE)`, report by field name | 10.6 |
+| Grand total vs declared > 1.00 INR (P/Q/S) | Emit `Discrepancy(GRAND_TOTAL, expected=declared, actual=grand_total)`, red-fill the Totals_Row cell, retain workbook | 11.4, 11.6, 11.8 |
+| Grand total vs declared ≤ 1.00 INR | Write cell with no red fill, no discrepancy | 11.5 |
+| Declared value absent/unreadable for a grand-total check (incl. missing BCD or SWS for column P) | Report "column X grand total could not be verified against the BOE", no red fill | 11.7 |
 | qty == 0 for rate-per-unit | Set rate to 0, no division | 6.10 |
 
 ### Defensive boundaries
@@ -612,13 +828,25 @@ properties.
   coordinates, values, labels, and emptiness.
 - **Tagging**: each property test carries a comment
   `# Feature: bill-of-entry-converter, Property {number}: {property_text}` and maps 1:1 to a property
-  above (Properties 1–17). Float comparisons use the requirement-specified 0.01 tolerance where relevant
-  and exact equality where full precision is asserted.
+  above (Properties 1–20). Float comparisons use the requirement-specified 0.01 tolerance where relevant,
+  the 1.00 INR tolerance for the grand-total checks (Properties 18–19), and exact equality where full
+  precision is asserted.
+- **Grand-total verification generators** (Properties 18–20): build strategies producing declared
+  duty-summary values and Excel grand totals across a wide magnitude range, including differences
+  straddling the 1.00 INR boundary (just below, exactly 1.00, and above) and combinations where one or
+  more declared values are missing/unreadable (including a missing `Declared_BCD`/`Declared_SWS` for the
+  column P check). Highlight assertions open the generated `.xlsx` and inspect the fill on cells P61/Q61/
+  S61 (indices 16/17/19 at the totals row).
 
 ### Example-based unit tests
 
 - Header-field extraction (Req 2.1–2.9) and per-line field extraction (Req 3.4–3.12) asserted against the
   reference PDF's known values, including the exemption-zero case (3.14) and a multi-page item.
+- Duty-summary declared totals (Req 10.1–10.4) asserted against the reference PDF's known values
+  (BCD 184250.2, SWS 18810.2, IGST 258391, TOTAL DUTY 465302), and against the second reference BOE
+  (`229411903072026INNSA1BE0040720261315.pdf`) to confirm the label set/geometry generalise; plus a
+  missing/unreadable duty-summary value example (Req 10.6) asserting `RawValue.missing()` + a reported
+  `declared_*` review flag.
 - `pcs` blank/compute boundary examples; qty==0 rate example (6.10); empty-document totals (7.3).
 - Declared-total-absent verification message (7.7).
 - Item-table and auxiliary header labels compared to the exact strings captured from the sample workbook
@@ -642,3 +870,84 @@ properties.
 A targeted test asserts that the parser's `_upright_words` filter excludes the BOE's rotated margin labels
 (e.g. `SLIATED`, `YTUD`, `SEITUD`), guarding against regressions where rotated text contaminates extracted
 rows — the primary extraction hazard identified during design.
+
+## Milestone 1.1 — Field-Accuracy Corrections (design)
+
+This section designs the fixes for Requirements 12–18. Each change is surgical and localized to one
+component; no architecture changes. Ground truth is the client's `bill_of_entry - with mistake.xlsx`
+(defects) vs `bill_of_entry - corrected copy.xlsx` (intended output), plus the reference pair
+`3. BE - 221981730062026INNSA1BE0040720261600.pdf` / `INV 1054.pdf`.
+
+### 12/13 — Header USD amount, USD rate, and verbatim dates
+
+- **Parser** (`_extract_header`): capture the invoice USD amount into `HeaderBlock.invoice_amount`
+  (already modeled) and, where the BOE prints an exchange rate, capture it into a new
+  `HeaderBlock.usd_rate_boe: RawValue` (default `RawValue.missing`). The User-supplied `usd_rate`
+  remains the fallback (Req 12.4).
+- **Excel_Generator** (`_write_header_block`):
+  - Write `G3` ("USD Amt") from `header.invoice_amount` (Req 12.2) via `_raw_cell_value`; leave blank when
+    missing (Req 12.5).
+  - Prefer `header.usd_rate_boe` for `G2` when present, else the User-supplied `header.usd_rate` (Req 12.3/12.4).
+  - Dates: write header dates as their verbatim `RawValue.raw_text` string, never a coerced `datetime`
+    (Req 13.1). Ensure the parser stores the printed date string as `raw_text`/`parsed=str` (not a parsed
+    `datetime`), and that `_raw_cell_value` returns the string. The footer detail block
+    (`_write_footer_details`) already writes the raw strings; align the top header block with it.
+
+### 14 — `pcs` for DOZ / GRS / THD (shared factor table)
+
+- Introduce a single shared mapping so Excel and JSON never diverge (Req 14.6). Move the factor table to a
+  common location (e.g. `boe_converter/units.py`):
+
+  ```python
+  UNIT_TO_PCS = {"DOZ": 12.0, "GRS": 144.0, "THD": 1000.0}
+  def pcs_factor(unit: str | None) -> float | None: ...
+  ```
+
+  `tally_exporter._UNIT_TO_PCS` and the calculator both consume this.
+- **Value_Calculator** `_pcs`: replace the DOZ-only branch with a factor lookup; `pcs = qty * factor` when
+  a factor exists, else `None` (Req 14.1–14.4).
+- **ComputedLine**: add `pcs_factor: float | None` (or expose the unit) so the writer can emit the correct
+  formula multiplier.
+- **Excel_Generator** `_write_item_row`: replace the hardcoded `f"=H{row}*12"` with
+  `f"=H{row}*{factor}"` using the line's factor; write blank when there is no factor (Req 14.5).
+
+### 15 — SWS from the BOE, not a fixed 10%
+
+- **Parser**: ensure per-line `bcd`/`sws` extraction records the printed SWS **rate** and **amount**,
+  storing an exemption 0 as numeric 0 (Req 15.1). `LineItem` already has room via the duty grid; expose
+  `sws_amount: RawValue` and `sws_rate: RawValue` if not already distinct.
+- **Value_Calculator** `_compute_line`: compute `sws_amount` from the BOE value:
+  - If an extracted per-line SWS amount is present (including 0), use it directly (Req 15.2/15.3).
+  - Else if an extracted SWS rate is present, `sws_amount = cust_aidc * sws_rate`.
+  - Else fall back to `cust_aidc * 0.10` **and** emit a `ReviewFlag` for that line (Req 15.4).
+  - Remove the unconditional `SWS_RATE = 0.10` multiply as the default path.
+- Downstream `total_customs_duty`, `igst_amount`, `combined_duty`, land costs already derive from
+  `sws_amount`, so they self-correct (Req 15.5). Column V (SWS rate) should reflect the actual rate used.
+
+### 16 — Full precision (no round-off)
+
+- Audit for any `round(...)`/format-as-value on monetary paths. The IGST/GST amount must stay at full
+  precision through `Totals` and the written cell (Req 16.1). Evidence `Q15 55.3 → 55.29535` indicates a
+  value was rounded (likely a `round`/number-format-as-value or a lossy parse). Confirm `_raw_cell_value`
+  writes the full `parsed` float for unit price from the BOE Part II UPI field; optional invoice
+  attachments must not replace the BOE unit price.
+- Keep decimal presentation in `number_format` only; never mutate the stored value (Req 16.3).
+
+### 17 — Grand-total highlight fires on genuine mismatch
+
+- The `_apply_grand_total_fills` mechanism is correct; the root cause is that the verified basis diverged
+  from the written totals (fabricated SWS + `other_duties_total` base). After Req 15, `total_customs_duty`
+  reconciles with `Declared_BCD + Declared_SWS`, so a real mismatch is detected and the red fill fires
+  (Req 17.1/17.3).
+- Verify the fill is applied after all Totals_Row writes and is not cleared by `_write_aux_templates` /
+  `_write_footer_details` (they target different rows/cols, so this holds), and that the orchestrator
+  actually threads `GrandTotalVerification` into `generate(...)` for every conversion (Req 17.2).
+
+### 18 — NOS items in the JSON export
+
+- **Parser**: confirm `NOS` is in the invoice/duty unit allow-list (`invoice_parser._UNITS` already lists
+  `NOS`) and that a NOS-unit row is not filtered out during `_merge_items`.
+- **TallyExporter.build**: every `ComputedLine` must yield an inventory allocation; NOS passes through
+  `_convert_to_pcs` unchanged (no factor) and must not be skipped by any rate-grouping or zero-amount
+  filter. Add a regression asserting a NOS line appears in `allledgerentries`.
+- **Excel_Generator**: `NOS` is written to the Unit column via the existing direct-value path (Req 18.3).

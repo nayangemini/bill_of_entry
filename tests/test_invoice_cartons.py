@@ -80,16 +80,18 @@ def test_lineitem_cartons_defaults_to_missing():
 # Orchestrator carton enrichment (stubbed invoice parser, no real PDF)
 # ---------------------------------------------------------------------------
 class _StubInvoiceParser:
-    def __init__(self, cartons=None, descriptions=None):
+    def __init__(self, cartons=None, descriptions=None, unit_prices=None):
         self._cartons = dict(cartons or {})
         self._descriptions = dict(descriptions or {})
+        self._unit_prices = dict(unit_prices or {})
 
     def parse_line_details(self, doc):  # noqa: ANN001
-        serials = set(self._cartons) | set(self._descriptions)
+        serials = set(self._cartons) | set(self._descriptions) | set(self._unit_prices)
         return {
             s: {
                 "cartons": self._cartons.get(s),
                 "description": self._descriptions.get(s),
+                "unit_price": self._unit_prices.get(s),
             }
             for s in serials
         }
@@ -151,6 +153,15 @@ def test_attach_invoice_keeps_boe_description_when_invoice_has_none():
     by_serial = {li.item_serial: li for li in enriched.line_items}
     assert by_serial[1].description.parsed == "ONLY ONE"
     assert by_serial[2].description.parsed == "item 2"  # unchanged BOE description
+
+
+def test_attach_invoice_keeps_boe_unit_price_when_invoice_has_price():
+    """Unit Price in USD is sourced from the BOE, never the optional invoice."""
+    orch = ConversionOrchestrator(
+        invoice_parser=_StubInvoiceParser(unit_prices={1: _num(0.12)})
+    )
+    enriched = orch._attach_cartons(_extracted(1), b"%PDF-fake")
+    assert enriched.line_items[0].unit_price_usd.parsed == 2.0
 
 
 # ---------------------------------------------------------------------------

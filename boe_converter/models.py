@@ -58,10 +58,17 @@ class HeaderBlock:
     be_date: RawValue             # Req 2.2
     bl_no: RawValue               # Req 2.9 (WHERE present)
     bl_date: RawValue             # Req 2.9
-    invoice_amount: RawValue      # Req 2.5
+    invoice_amount: RawValue      # Req 2.5 (total invoice amount, in USD; Req 12.1)
     invoice_currency: RawValue    # Req 2.5
     package_count: RawValue       # PKG/CTN total e.g. 1357 (Req 2.6, 7.5)
     container_details: RawValue   # container number + count (Req 2.8)
+    # --- Part I "C. DUTY SUMMARY" declared document-level totals (Req 10) ---
+    # Captured verbatim (numeric) from the BOE duty summary; each defaults to
+    # RawValue.missing() and is never inferred when absent (Req 10.5/10.6).
+    declared_bcd: RawValue = field(default_factory=RawValue.missing)         # Req 10.3
+    declared_sws: RawValue = field(default_factory=RawValue.missing)         # Req 10.4
+    declared_igst: RawValue = field(default_factory=RawValue.missing)        # Req 10.2
+    declared_total_duty: RawValue = field(default_factory=RawValue.missing)  # Req 10.1
     # --- Buyer (importer) identity, extracted from Part I "IMPORTER" block ---
     # These feed the Tally voucher (cmpgstin/consignee*/basicbuyeraddress) so the
     # buyer is populated FROM THE BOE rather than a hardcoded default. Each
@@ -73,6 +80,11 @@ class HeaderBlock:
     # --- Seller (supplier) identity, extracted from Part I "SUPPLIER" block ---
     seller_address: RawValue = field(default_factory=RawValue.missing)
     seller_country: RawValue = field(default_factory=RawValue.missing)
+    # --- USD exchange rate as printed on the BOE (Req 12.3) ---
+    # Captured verbatim from the BOE's "EXCHANGE RATE" band (e.g. "1 USD=95.3INR"
+    # -> 95.3). Defaults to missing; when absent the Excel_Generator falls back
+    # to the User-supplied ``usd_rate`` (Req 12.4). Never inferred when absent.
+    usd_rate_boe: RawValue = field(default_factory=RawValue.missing)
 
 
 @dataclass(frozen=True)
@@ -90,6 +102,13 @@ class LineItem:
     bcd_amount: RawValue          # Req 3.10
     igst_rate: RawValue           # Req 3.11
     total_duty: RawValue          # Req 3.12
+    # Social Welfare Surcharge as printed on the BOE (Req 15.1-15.5). An
+    # exemption is captured as numeric 0 (NOT missing) so the calculator honours
+    # a declared 0% SWS instead of fabricating a 10% surcharge. Both default to
+    # missing; when both are absent the calculator falls back to 10% of the
+    # customs-duty base and flags the line for review.
+    sws_rate: RawValue = field(default_factory=RawValue.missing)    # Req 15.1
+    sws_amount: RawValue = field(default_factory=RawValue.missing)  # Req 15.1
     # Additional customs cess (Part III "2.CHCESS"); present only on some BOEs.
     # When present it is added to the BCD amount to form the customs-duty base
     # (CUST AIDC, Excel column U); defaults to missing (treated as 0).
@@ -139,7 +158,8 @@ class ComputedLine:
     combined_duty: float | None = None           # Req 6.6  = total_customs_duty + igst_amount
     land_cost_excl_gst: float | None = None      # Req 6.7  = purchase_inr + total_customs_duty
     land_cost_incl_gst: float | None = None      # Req 6.8  = land_cost_excl_gst + igst_amount
-    pcs: float | None = None                     # Req 5.8  = qty*12 when unit=="DOZ"
+    pcs: float | None = None                     # Req 5.8  = qty*pcs_factor(unit) (DOZ/GRS/THD)
+    pcs_factor: float | None = None              # Req 14.x pieces-per-unit factor used for pcs / Excel formula
     purchase_rate_per_unit: float | None = None  # Req 6.9  = land_cost_excl_gst / qty ; 0 when qty==0
 
 
@@ -186,10 +206,42 @@ class ReviewFlag:
 class Discrepancy:
     """A cross-check mismatch surfaced to the User (never a silent drop)."""
 
-    kind: Literal["ITEM_COUNT", "INVOICE_TOTAL", "RECOMPUTE"]
+    kind: Literal["ITEM_COUNT", "INVOICE_TOTAL", "RECOMPUTE", "GRAND_TOTAL"]
     message: str
     expected: float | int | str | None = None   # declared/extracted value
     actual: float | int | str | None = None     # computed/recomputed value
+
+
+# ---------------------------------------------------------------------------
+# Grand-total verification models (Req 10 & 11)
+# ---------------------------------------------------------------------------
+
+# Tolerance (in INR) for comparing an Excel Totals_Row grand total against the
+# BOE's declared Part I duty-summary value. Differences of at most this amount
+# are treated as a match; larger differences are a MISMATCH (Req 11.4/11.5).
+GRAND_TOTAL_TOLERANCE_INR = 1.00
+
+
+@dataclass(frozen=True)
+class GrandTotalCheck:
+    """Result of verifying one Totals_Row grand total against the BOE (Req 11)."""
+
+    column: Literal["P", "Q", "S"]     # affected Excel Totals_Row column
+    declared: float | None             # BOE declared value; None if missing/unreadable
+    excel_total: float                 # the grand total written to the Totals_Row
+    status: Literal["MATCH", "MISMATCH", "UNVERIFIED"]
+
+
+@dataclass(frozen=True)
+class GrandTotalVerification:
+    """The three column checks plus the derived highlight set."""
+
+    checks: list[GrandTotalCheck]
+
+    @property
+    def highlight_columns(self) -> set[str]:
+        """Excel column letters whose cell must be red-filled (Req 11.4)."""
+        return {c.column for c in self.checks if c.status == "MISMATCH"}
 
 
 # ---------------------------------------------------------------------------

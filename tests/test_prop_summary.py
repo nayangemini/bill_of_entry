@@ -76,7 +76,7 @@ class _FakeParser:
 class _FakeGenerator:
     """Returns fixed workbook bytes (no real Excel built)."""
 
-    def generate(self, computed, flags) -> bytes:
+    def generate(self, computed, flags, grand_total_check=None) -> bytes:
         return b"xlsx"
 
 

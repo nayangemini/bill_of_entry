@@ -41,6 +41,7 @@ import uuid
 from dataclasses import dataclass, replace
 
 from boe_converter.models import ComputedDocument, ComputedLine, HeaderBlock, RawValue
+from boe_converter.units import UNIT_TO_PCS, pcs_factor
 
 # ---------------------------------------------------------------------------
 # Pure Tally structural constants (never printed on a BOE)
@@ -54,7 +55,8 @@ CUSTOM_DUTY_LEDGER = "Custom Duty Payable"
 TAX_FREE_LEDGER = "Tax Free (Purchases)"
 
 # Unit conversion factors to pieces (PCS). A unit not listed is left unchanged.
-_UNIT_TO_PCS = {"DOZ": 12.0, "GRS": 144.0, "THD": 1000.0}
+# Sourced from the shared table in ``boe_converter.units``.
+_UNIT_TO_PCS = UNIT_TO_PCS
 
 
 @dataclass(frozen=True)
@@ -122,7 +124,7 @@ def _convert_to_pcs(qty: float, unit: str) -> tuple[float, str]:
 
     Returns ``(converted_qty, converted_unit)``; unchanged for other units.
     """
-    factor = _UNIT_TO_PCS.get(unit.upper().strip()) if unit else None
+    factor = pcs_factor(unit)
     if factor:
         return qty * factor, "PCS"
     return qty, unit

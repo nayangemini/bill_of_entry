@@ -59,7 +59,7 @@ class _FakeParser:
 class _FakeGenerator:
     """Returns fixed bytes, avoiding real workbook construction."""
 
-    def generate(self, doc, flags) -> bytes:
+    def generate(self, doc, flags, grand_total_check=None) -> bytes:
         return b"xlsx"
 
 

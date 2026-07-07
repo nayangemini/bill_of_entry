@@ -35,6 +35,17 @@ The reference inputs/outputs used to derive these requirements are:
   (Company name, Party Name, USD Rate, Details, Invoice No/Date, BE No/Date, B/L No/Date, etc.).
 - **Item_Table**: The line-item table in the target Excel beginning at the header row (row 12).
 - **Totals_Row**: The summary row in the target Excel that aggregates numeric columns (row 61 in the sample).
+- **Grand_Total**: A single aggregated column total written in the Totals_Row. The Grand_Totals referenced by
+  the verification feature are: column P (TOTAL Custom Duty = per-line customs duty excluding IGST summed =
+  `Totals.total_customs_duty`), column Q (GST = per-line IGST summed = `Totals.total_igst`), and column S
+  (total custom duty = per-line combined duty summed = `Totals.total_customs_duty + Totals.total_igst`).
+- **Duty_Summary**: The Part I "C. DUTY SUMMARY" section of the BOE that prints document-level declared duty
+  totals, including BCD, ACD, SWS, NCCD, ADD, CVD, IGST, G.CESS, TOT.ASS VAL, TOTAL DUTY, and TOT.AMOUNT.
+- **Declared_TOTAL_DUTY**: The TOTAL DUTY value printed in the BOE Duty_Summary (465302 in the sample); the
+  sum of all customs duties plus IGST.
+- **Declared_IGST**: The IGST value printed in the BOE Duty_Summary (258391 in the sample).
+- **Declared_BCD**: The BCD (Basic Customs Duty) total value printed in the BOE Duty_Summary (184250.2 in the sample).
+- **Declared_SWS**: The SWS (Social Welfare Surcharge) total value printed in the BOE Duty_Summary (18810.2 in the sample).
 - **CTH / HSN Code**: Customs Tariff Heading / Harmonized System Nomenclature classification code for an item.
 - **Assessable_Value**: The customs-assessed value (INR) of a Line_Item, shown as "ASSESS VALUE" in the BOE.
 - **BCD (Basic Customs Duty)**: A customs duty levied as a percentage of the Assessable_Value.
@@ -196,6 +207,39 @@ The reference inputs/outputs used to derive these requirements are:
 4. IF a numeric value extracted from the BOE differs from the same value recomputed from its related fields by more than 0.01 in that value's unit, THEN THE Converter SHALL report both the extracted value and the recomputed value to the User.
 5. THE Converter SHALL NOT remove a Line_Item from the output solely because one of its fields failed to parse.
 
+### Requirement 10: Extract the BOE Part I duty-summary declared totals
+
+**User Story:** As a User, I want the document-level duty totals read from the BOE's Part I duty summary, so that the Excel grand totals can be verified against the amounts the customs authority declared.
+
+> Context: The existing PDF_Parser extracts header fields (Requirement 2) and per-line values (Requirement 3)
+> but does NOT yet extract the Part I "C. DUTY SUMMARY" document-level totals. This requirement adds that
+> extraction so Requirement 11 can compare the Excel grand totals against the BOE.
+
+#### Acceptance Criteria
+
+1. THE PDF_Parser SHALL extract the Declared_TOTAL_DUTY value from the Duty_Summary of the BOE.
+2. THE PDF_Parser SHALL extract the Declared_IGST value from the Duty_Summary of the BOE.
+3. THE PDF_Parser SHALL extract the Declared_BCD value from the Duty_Summary of the BOE.
+4. THE PDF_Parser SHALL extract the Declared_SWS value from the Duty_Summary of the BOE.
+5. THE PDF_Parser SHALL record each extracted Duty_Summary value as the value printed in the BOE, preserving its digits and decimal places without rounding, truncating, reformatting, or inferring content.
+6. IF a Duty_Summary value required by criteria 1 through 4 cannot be located in the BOE, or its printed characters cannot be resolved into a numeric value, THEN THE Converter SHALL record that value as missing, SHALL report it to the User identified by its field name, and SHALL NOT substitute an inferred or default value.
+
+### Requirement 11: Verify Excel grand totals against the BOE duty summary and highlight mismatches
+
+**User Story:** As a User, I want the Excel grand totals for customs duty, GST, and combined duty checked against the BOE duty summary, and any mismatch highlighted in red, so that I can immediately see where the generated workbook disagrees with the BOE.
+
+#### Acceptance Criteria
+
+1. WHEN the Totals_Row is generated, THE Converter SHALL compare the column P Grand_Total (`Totals.total_customs_duty`) against the BOE declared customs duty excluding IGST, computed as Declared_BCD plus Declared_SWS.
+2. WHEN the Totals_Row is generated, THE Converter SHALL compare the column Q Grand_Total (`Totals.total_igst`) against the Declared_IGST.
+3. WHEN the Totals_Row is generated, THE Converter SHALL compare the column S Grand_Total (`Totals.total_customs_duty` plus `Totals.total_igst`) against the Declared_TOTAL_DUTY.
+4. IF a compared Grand_Total differs from its corresponding BOE declared value by more than 1.00 INR, THEN THE Excel_Generator SHALL apply a solid red cell fill to that Grand_Total cell in the Totals_Row.
+5. IF a compared Grand_Total differs from its corresponding BOE declared value by no more than 1.00 INR, THEN THE Excel_Generator SHALL write that Grand_Total cell without applying the red cell fill.
+6. IF a compared Grand_Total differs from its corresponding BOE declared value by more than 1.00 INR, THEN THE Converter SHALL surface a Discrepancy to the User identifying the affected Excel column, the Excel Grand_Total, and the BOE declared value.
+7. IF a BOE declared value required for a comparison in criteria 1 through 3 is absent or unreadable, including a missing Declared_BCD or Declared_SWS required for the column P comparison, THEN THE Converter SHALL report to the User that the corresponding Grand_Total could not be verified against the BOE, and SHALL write that Grand_Total cell without applying the red cell fill.
+8. WHEN a Grand_Total mismatch is highlighted, THE Converter SHALL retain the generated workbook and SHALL make the workbook available for download.
+9. WHEN the Converter presents the conversion summary, THE Converter SHALL include each grand-total verification Discrepancy in the summary reported to the User.
+
 ## Source-to-Target Field Mapping (informative)
 
 This table records the field-by-field mapping derived from the sample PDF and Excel. It classifies each
@@ -235,6 +279,23 @@ are stated normatively in Requirement 6.
 > INTEREST" holds the BCD rate / SWS rate). The mapping above reflects the **actual** computed behavior
 > observed in the sample, which the implementation must reproduce. This should be confirmed (Open Q4).
 
+## Grand-Total Verification Mapping (informative)
+
+This table records the working mapping used by Requirement 11 to verify Excel grand totals against the BOE
+Duty_Summary. Values shown are from the sample BOE. The tolerance and highlight styling still need User
+confirmation (see Open Q11-Q12).
+
+| Excel Grand_Total (Totals_Row) | Computed as | BOE Duty_Summary value | Sample value |
+|---|---|---|---|
+| Column P — TOTAL Custom Duty | `Totals.total_customs_duty` | Declared_BCD + Declared_SWS | 184250.2 + 18810.2 = 203060.4 |
+| Column Q — GST | `Totals.total_igst` | Declared_IGST | 258391 |
+| Column S — total custom duty | `Totals.total_customs_duty + Totals.total_igst` | Declared_TOTAL_DUTY | 465302 |
+
+> Note: Column P is verified against the BOE's declared BCD + SWS totals (per the resolution of Open Q10),
+> which matches the modeled per-line customs duty basis (`total_customs_duty` = BCD + SWS). Because the
+> verification basis and the modeled basis are the same duty components, the column P check no longer risks
+> a false mismatch from unmodeled duty components (ACD, NCCD, ADD, CVD, G.CESS).
+
 ## Open Questions / Assumptions
 
 These items were identified while reverse-engineering the sample and need User confirmation. Current
@@ -262,3 +323,136 @@ Requirements 5-7.
    BOE containing multiple invoices, or is single-invoice sufficient? *Assumption:* single-invoice sufficient for Milestone 1.
 9. **Auxiliary sections (Challans, Tally, C&F):** Confirm these lower sections should be emitted as empty
    templates in Milestone 1 (data entry/Tally linkage deferred to Milestone B). *Assumption:* empty templates.
+10. **Column P verification basis (Requirement 11): RESOLVED.** Per User decision, column P
+    (`Totals.total_customs_duty`) is verified against the BOE's declared BCD + SWS totals
+    (Declared_BCD + Declared_SWS), not against Declared_TOTAL_DUTY − Declared_IGST. This matches the modeled
+    per-line customs duty basis (BCD + SWS), so the check does not require modeling the remaining BOE duty
+    components (ACD, NCCD, ADD, CVD, G.CESS). Requirement 11 criterion 1 and the Grand-Total Verification
+    Mapping have been updated accordingly.
+11. **Verification tolerance (Requirement 11):** The BOE Duty_Summary prints values that appear rounded to
+    whole rupees (e.g., TOTAL DUTY 465302), while the Excel grand totals are retained at full floating-point
+    precision (Requirement 8). What INR tolerance should a "match" allow? *Assumption:* 1.00 INR, versus the
+    0.01 USD tolerance used for the invoice-total cross-check in Requirement 7.
+12. **Highlight styling (Requirement 11):** A solid red cell fill is assumed for mismatched grand-total cells.
+    Confirm the exact fill shade (e.g., ARGB `FFFF0000`) and whether matching cells should ever receive an
+    affirmative "verified" style (e.g., green) or simply remain unstyled. *Assumption:* solid red fill on
+    mismatch only; matching cells left unstyled.
+13. **BCD and SWS declared totals (Requirement 10): RESOLVED.** Following the resolution of Open Q10 toward a
+    BCD + SWS basis for column P, Requirement 10 now extracts four declared Duty_Summary values —
+    Declared_BCD, Declared_SWS, Declared_IGST, and Declared_TOTAL_DUTY — and Declared_BCD and Declared_SWS
+    have been added to the Glossary.
+
+## Milestone 1.1 — Field-Accuracy Corrections (bug-fix batch)
+
+> These requirements capture defects found while converting real BOEs
+> (`3. BE - 221981730062026INNSA1BE0040720261600.pdf` + `INV 1054.pdf`), verified against the
+> client's own `bill_of_entry - with mistake.xlsx` (defects marked pink) and
+> `bill_of_entry - corrected copy.xlsx` (the intended output). Where a correction contradicts an earlier
+> assumption or clause it **supersedes** it; the superseded clause is named explicitly.
+>
+> Documentation gap noted: the code already contains a **Tally/JSON export** component
+> (`tally_exporter.py`) plus per-line `other_duties_total` and buyer/seller extraction that the original
+> Milestone 1 spec listed as out of scope ("Milestone B"). Requirements 18 below governs the JSON export
+> defect only; a full spec pass documenting the Tally exporter is recommended as separate follow-up work.
+
+### Requirement 12: Populate the USD invoice amount and USD rate in the Excel header from the BOE
+
+**User Story:** As a User, I want the USD amount and USD rate shown in the Excel header block filled from the BOE, so that the header reflects the source document without manual entry.
+
+> Supersedes Open Question 5 (USD_Rate User-supplied) and the "USD Amt" no-source treatment in
+> Requirement 4.8. Evidence: corrected workbook cell `G3` = `13757.09` (the BOE invoice USD amount),
+> `G2` = the USD rate.
+
+#### Acceptance Criteria
+
+1. THE PDF_Parser SHALL extract the total invoice amount expressed in USD from the BOE.
+2. THE Excel_Generator SHALL write the extracted USD invoice amount into the header block "USD Amt" value cell (`G3`) at full numeric precision, without rounding or reformatting.
+3. WHERE the BOE prints a USD exchange rate, THE PDF_Parser SHALL extract it and THE Excel_Generator SHALL write it into the "USD Rate" value cell (`G2`) at full numeric precision.
+4. WHERE the BOE does not print a USD exchange rate, THE Converter SHALL fall back to the User-supplied USD rate as in Milestone 1.
+5. IF the USD invoice amount cannot be located or resolved, THEN THE Converter SHALL record it as missing, report it to the User by field name, and leave the "USD Amt" cell blank rather than substituting a value.
+
+### Requirement 13: Preserve BOE header values verbatim without date/number reformatting
+
+**User Story:** As a User, I want dates and identifiers written exactly as printed on the BOE, so that no value is silently transformed.
+
+> Reinforces Requirement 4.2/4.3 and Requirement 2.11. Evidence: mistake workbook wrote the invoice date
+> as an Excel `datetime` (`2026-06-11`) where the intended value is the printed string `11-JUN-26` (cell
+> `G4`).
+
+#### Acceptance Criteria
+
+1. THE Excel_Generator SHALL write each extracted header date (Invoice Date, BE Date, B/L Date) as the verbatim printed string, and SHALL NOT coerce it into an Excel date/serial value or otherwise reformat it.
+2. THE Excel_Generator SHALL write each extracted header identifier (Invoice No, BE No, B/L No) as the verbatim printed value without reformatting.
+
+### Requirement 14: Compute the `pcs` column for all piece-equivalent units (DOZ, GRS, THD)
+
+**User Story:** As a User, I want the Excel `pcs` column to convert dozens, gross, and thousands to pieces just like the JSON export does, so that the two outputs agree.
+
+> Supersedes Requirement 5.8/5.9 (DOZ-only). Evidence: corrected/mistake workbook `pcs` uses `=H*144`
+> for a GRS-unit line. The JSON exporter already applies `DOZ×12, GRS×144, THD×1000`
+> (`tally_exporter._UNIT_TO_PCS`); the Excel `pcs` rule must match it exactly.
+
+#### Acceptance Criteria
+
+1. WHERE a Line_Item's unit, trimmed and upper-cased, equals `"DOZ"`, THE Value_Calculator SHALL compute `pcs` as QTY × 12.
+2. WHERE a Line_Item's unit, trimmed and upper-cased, equals `"GRS"`, THE Value_Calculator SHALL compute `pcs` as QTY × 144.
+3. WHERE a Line_Item's unit, trimmed and upper-cased, equals `"THD"`, THE Value_Calculator SHALL compute `pcs` as QTY × 1000.
+4. WHERE a Line_Item's unit is none of `DOZ`, `GRS`, `THD`, THE Value_Calculator SHALL leave the `pcs` cell blank.
+5. THE Excel_Generator SHALL write the `pcs` cell (and, in formula mode, the multiplier in its formula) using the factor that matches the line's unit.
+6. THE piece-conversion factors used by the Excel `pcs` column and by the JSON/Tally export SHALL be identical.
+
+### Requirement 15: Use the BOE-declared SWS rate instead of a fixed 10%
+
+**User Story:** As a User, I want the Social Welfare Surcharge to reflect what the BOE actually declares, so that an exempt (0%) line does not receive a fabricated 10% surcharge and cause a GST/grand-total mismatch.
+
+> Supersedes Requirement 6.3 (SWS fixed at 0.10) and Open Question 4 ("Confirm SWS is always 10% of
+> BCD"). Evidence: a real line carried a 0 SWS rate, yet the tool applied 10%, producing a GST mismatch.
+
+#### Acceptance Criteria
+
+1. THE PDF_Parser SHALL extract the per-line SWS rate and SWS amount as printed in the BOE, treating an exemption-driven 0 as the numeric value 0 (not blank).
+2. THE Value_Calculator SHALL compute the per-line SWS amount from the BOE-declared SWS rate/amount rather than a hardcoded 10%.
+3. WHERE the BOE-declared per-line SWS rate or amount is 0, THE Value_Calculator SHALL set the per-line SWS amount to 0.
+4. WHERE the BOE-declared SWS rate/amount cannot be located for a line, THE Value_Calculator MAY fall back to 10% of the customs-duty base, and SHALL flag that line as requiring User review.
+5. THE per-line total customs duty, IGST, combined duty, and land-cost values SHALL be derived from the corrected SWS amount so that the column P/Q/S grand totals reconcile with the BOE duty summary.
+
+### Requirement 16: Retain full numeric precision for computed monetary values (no round-off)
+
+**User Story:** As a User, I want computed values kept at full precision, so that totals reconcile and no rounding error accumulates.
+
+> Reinforces Requirement 6.12 and 8.5; documents the observed defect. Evidence: mistake workbook `Q15` =
+> `55.3` where the correct GST value is `55.29535`.
+
+#### Acceptance Criteria
+
+1. THE Value_Calculator SHALL retain every per-line computed monetary value (including the IGST/GST amount) at full floating-point precision, without rounding or truncation to a fixed number of decimals.
+2. THE Excel_Generator SHALL write each directly-extracted value (including Unit Price in USD) at its full extracted precision, without rounding.
+3. THE Converter SHALL source Unit Price in USD from the BOE Part II UPI field, not from any optional invoice attachment.
+4. THE Converter SHALL confine any decimal rounding to display/number-format only, and SHALL NOT alter the stored cell value.
+
+### Requirement 17: Grand-total mismatch highlight must fire on a genuine duty mismatch
+
+**User Story:** As a User, I want the grand-total re-check to actually highlight a mismatched total in red, so that I can see disagreements with the BOE at a glance.
+
+> Extends Requirement 11. Evidence: a real conversion had a duty/GST mismatch that was not highlighted,
+> because the comparison basis diverged from the modeled totals (tied to the SWS defaulting defect,
+> Requirement 15).
+
+#### Acceptance Criteria
+
+1. THE Converter SHALL compute the column P/Q/S grand-total verification on the same duty basis that produces the written totals, so a genuine mismatch beyond 1.00 INR is detected.
+2. WHEN a grand-total mismatch beyond 1.00 INR is detected, THE Excel_Generator SHALL apply the solid red fill to the affected Totals_Row cell and the fill SHALL persist in the saved workbook (it SHALL NOT be overwritten by later writing steps).
+3. WHEN the SWS correction (Requirement 15) removes a previously-fabricated surcharge, THE grand-total verification SHALL reflect the corrected totals.
+
+### Requirement 18: NOS-unit line items must be carried into the JSON/Tally export
+
+**User Story:** As a User, I want line items whose unit is NOS to appear in the JSON output, so that no product is dropped from the Tally import.
+
+> Governs the JSON/Tally export defect only. Evidence: a NOS-unit line was absent from the produced JSON.
+
+#### Acceptance Criteria
+
+1. THE PDF_Parser SHALL extract the unit value `NOS` for any Line_Item that declares it, and SHALL NOT drop such a Line_Item.
+2. THE JSON/Tally export SHALL include every Line_Item, including those whose unit is `NOS`, with its quantity and unit preserved (NOS is not a piece-equivalent unit, so its quantity is carried through unchanged).
+3. THE Excel_Generator SHALL write `NOS` into the Unit column for such line items.
+4. THE Converter SHALL NOT omit a Line_Item from either the Excel output or the JSON output solely because its unit is `NOS`.

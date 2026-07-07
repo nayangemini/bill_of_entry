@@ -436,6 +436,8 @@ class OldFormatParser:
             assessable_value=num("ass"),
             bcd_rate=rate("bcd_rt"),
             bcd_amount=num("bcd_amt"),
+            sws_rate=rate("sws_rt"),
+            sws_amount=num("sws_amt"),
             igst_rate=rate("igst_rt"),
             total_duty=RawValue.missing(),  # not printed per line in this format
         )

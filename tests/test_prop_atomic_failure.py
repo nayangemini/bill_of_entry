@@ -136,7 +136,9 @@ class _FakeGenerator:
         self._exc = exc
         self._data = data
 
-    def generate(self, computed: ComputedDocument, flags: ReviewFlagSet) -> bytes:
+    def generate(
+        self, computed: ComputedDocument, flags: ReviewFlagSet, grand_total_check=None
+    ) -> bytes:
         if self._exc is not None:
             raise self._exc
         return self._data
