@@ -23,6 +23,7 @@ JSON generation use the stored data.
 
 from __future__ import annotations
 
+import datetime as _dt
 import hmac
 import inspect
 import io
@@ -213,7 +214,12 @@ def _first(row: dict, *keys: str) -> str:
 
 def _render_data_manager() -> None:
     """Main-area manager: view/add/edit/delete + bulk upload for stored data."""
-    from boe_converter.tally_store import BuyerRecord, SellerRecord, StoreError
+    from boe_converter.tally_store import (
+        BuyerRecord,
+        LedgerRecord,
+        SellerRecord,
+        StoreError,
+    )
 
     store = _get_store()
     with st.expander("📇 Manage stored data (Neon)", expanded=False):
@@ -221,11 +227,13 @@ def _render_data_manager() -> None:
             st.warning("Database not connected — stored-data features are disabled.")
             return
         st.success("Database connected.")
-        tab_stock, tab_buyers, tab_sellers = st.tabs(
-            ["Stock names", "Buyers", "Sellers"]
+        tab_stock, tab_ledgers, tab_buyers, tab_sellers = st.tabs(
+            ["Stock names", "Ledgers", "Buyers", "Sellers"]
         )
         with tab_stock:
             _manage_stock(store, StoreError)
+        with tab_ledgers:
+            _manage_ledgers(store, LedgerRecord, StoreError)
         with tab_buyers:
             _manage_buyers(store, BuyerRecord, StoreError)
         with tab_sellers:
@@ -314,6 +322,8 @@ def _manage_buyers(store, BuyerRecord, StoreError) -> None:
             "state": b.state,
             "pincode": b.pincode,
             "address": _addr_to_cell(b.address_lines),
+            "tax_unit": b.tax_unit,
+            "tally_name": b.tally_name,
         }
         for b in buyers
     ]
@@ -326,6 +336,19 @@ def _manage_buyers(store, BuyerRecord, StoreError) -> None:
         column_config={
             "name": st.column_config.TextColumn("Name", required=True),
             "address": st.column_config.TextColumn("Address (lines split by |)"),
+            "tax_unit": st.column_config.TextColumn(
+                "GST registration (tax unit)",
+                help="The registration's name in Tally, e.g. 'Maharashtra "
+                "Registration'. Blank uses '<state> Registration'. Without it "
+                "Tally cannot bind the voucher's numbering series to a "
+                "registration.",
+            ),
+            "tally_name": st.column_config.TextColumn(
+                "Tally company name",
+                help="As it appears on the voucher's buyer line, including any "
+                "financial-year suffix, e.g. 'Acme LLP (F.Y. 2026-27)'. Blank "
+                "uses the buyer name.",
+            ),
         },
     )
     c1, c2 = st.columns([1, 2])
@@ -343,6 +366,8 @@ def _manage_buyers(store, BuyerRecord, StoreError) -> None:
                     state=str(r.get("state", "")).strip(),
                     pincode=str(r.get("pincode", "")).strip(),
                     address_lines=_cell_to_addr(r.get("address", "")),
+                    tax_unit=str(r.get("tax_unit", "") or "").strip(),
+                    tally_name=str(r.get("tally_name", "") or "").strip(),
                 )
             )
         for b in buyers:  # deletions (rows removed in the grid)
@@ -352,15 +377,19 @@ def _manage_buyers(store, BuyerRecord, StoreError) -> None:
         st.rerun()
     c2.download_button(
         "⬇ Export CSV",
-        data=_csv_bytes(rows, ["name", "gstin", "state", "pincode", "address"]),
+        data=_csv_bytes(
+            rows,
+            ["name", "gstin", "state", "pincode", "address", "tax_unit", "tally_name"],
+        ),
         file_name="buyers.csv",
         mime="text/csv",
         key="dl_buyers",
     )
 
     st.markdown(
-        "**Bulk upload** — CSV/Excel columns: `name, gstin, state, pincode, address` "
-        "(address lines separated by `|`)."
+        "**Bulk upload** — CSV/Excel columns: `name, gstin, state, pincode, address, "
+        "tax_unit, tally_name` (address lines separated by `|`; the last two are "
+        "optional)."
     )
     up = st.file_uploader("Upload buyers", type=["csv", "xlsx"], key="bulk_buyers")
     if up is not None and st.button("Import buyers", key="imp_buyers"):
@@ -376,10 +405,133 @@ def _manage_buyers(store, BuyerRecord, StoreError) -> None:
                     state=_first(r, "state"),
                     pincode=_first(r, "pincode", "pin"),
                     address_lines=_cell_to_addr(_first(r, "address", "address_lines")),
+                    tax_unit=_first(r, "tax_unit", "tax unit", "registration"),
+                    tally_name=_first(r, "tally_name", "tally name", "company"),
                 )
             )
         saved = store.add_buyers(recs)
         st.success(f"Imported/updated {saved} buyer(s).")
+        st.rerun()
+
+
+# The ledger kinds a purchase voucher needs, with the label shown in the grid.
+_LEDGER_KIND_LABELS = {
+    "purchase": "Purchase (per IGST rate)",
+    "igst_purchase": "IGST Purchase (per rate)",
+    "igst_payable": "IGST Payable (per rate)",
+    "custom_duty": "Custom Duty Payable",
+    "tax_free": "Tax Free (Purchases)",
+}
+_RATELESS_KINDS = ("custom_duty", "tax_free")
+
+
+def _manage_ledgers(store, LedgerRecord, StoreError) -> None:
+    st.caption(
+        "The **exact** ledger names in this company's Tally, kept separately per "
+        "company. These cannot be derived — one company's Tally holds "
+        "`Igst Purchase @18.00%` where the usual pattern would give "
+        "`IGST Purchase @ 18.00 %`, and importing the wrong spelling creates a "
+        "duplicate ledger instead of posting to the real one. Rate is the IGST "
+        "percentage (leave 0 for Custom Duty and Tax Free)."
+    )
+    company = st.selectbox(
+        "Company (Tally)", _company_options(store, StoreError), key="ledger_company"
+    )
+    try:
+        ledgers = store.list_ledgers(company)
+    except StoreError as exc:
+        st.error(str(exc))
+        return
+
+    rows = [
+        {
+            "kind": l.kind,
+            "rate %": l.rate_bp / 100.0,
+            "ledger name in Tally": l.name,
+        }
+        for l in ledgers
+    ]
+    edited = st.data_editor(
+        rows,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="ledgers_grid",
+        column_config={
+            "kind": st.column_config.SelectboxColumn(
+                "Kind", options=list(_LEDGER_KIND_LABELS), required=True
+            ),
+            "rate %": st.column_config.NumberColumn("IGST rate %", min_value=0.0, step=0.5),
+            "ledger name in Tally": st.column_config.TextColumn(
+                "Ledger name in Tally", required=True
+            ),
+        },
+    )
+    c1, c2 = st.columns([1, 2])
+    if c1.button("💾 Save changes", key="save_ledgers"):
+        kept: set[tuple[str, int]] = set()
+        recs = []
+        for r in edited:
+            kind = str(r.get("kind", "")).strip()
+            name = str(r.get("ledger name in Tally", "")).strip()
+            if not kind or not name:
+                continue
+            rate_bp = 0 if kind in _RATELESS_KINDS else round(float(r.get("rate %") or 0) * 100)
+            kept.add((kind, rate_bp))
+            recs.append(
+                LedgerRecord(company=company, kind=kind, rate_bp=rate_bp, name=name)
+            )
+        try:
+            store.add_ledgers(recs)
+            for l in ledgers:
+                if (l.kind, l.rate_bp) not in kept:
+                    store.delete_ledger(company, l.kind, l.rate_bp)
+        except StoreError as exc:
+            st.error(str(exc))
+            return
+        st.success(f"Ledgers saved for {company}.")
+        st.rerun()
+    c2.download_button(
+        "⬇ Export CSV",
+        data=_csv_bytes(
+            [
+                {"kind": r["kind"], "rate": r["rate %"], "name": r["ledger name in Tally"]}
+                for r in rows
+            ],
+            ["kind", "rate", "name"],
+        ),
+        file_name=f"ledgers_{company}.csv".replace(" ", "_"),
+        mime="text/csv",
+        key="dl_ledgers",
+    )
+
+    st.markdown(
+        "**Bulk upload** — CSV/Excel columns: `kind, rate, name`. `kind` is one of "
+        + ", ".join(f"`{k}`" for k in _LEDGER_KIND_LABELS)
+        + "; `rate` is the IGST percentage (0 for Custom Duty / Tax Free)."
+    )
+    up = st.file_uploader("Upload ledgers", type=["csv", "xlsx"], key="bulk_ledgers")
+    if up is not None and st.button("Import ledgers", key="imp_ledgers"):
+        recs = []
+        for r in _read_uploaded_table(up):
+            kind = _first(r, "kind", "type").strip().lower()
+            name = _first(r, "name", "ledger", "ledger name")
+            if kind not in _LEDGER_KIND_LABELS or not name:
+                continue
+            try:
+                rate = float(_first(r, "rate", "rate %", "igst", "igst rate") or 0)
+            except ValueError:
+                rate = 0.0
+            rate_bp = 0 if kind in _RATELESS_KINDS else round(rate * 100)
+            recs.append(
+                LedgerRecord(company=company, kind=kind, rate_bp=rate_bp, name=name)
+            )
+        try:
+            n = store.add_ledgers(recs)
+        except StoreError as exc:
+            st.error(str(exc))
+            return
+        st.success(f"Imported {n} ledger name(s) for {company}.")
         st.rerun()
 
 
@@ -727,7 +879,26 @@ st.caption(
 )
 
 from boe_converter.excel_reader import ExcelReadError, read_workbook
-from boe_converter.tally_exporter import CompanyProfile, SellerProfile, TallyExporter
+from boe_converter.tally_exporter import (
+    CompanyProfile,
+    LedgerBook,
+    SellerProfile,
+    TallyExporter,
+    company_profile_for,
+    seller_profile_for,
+    tally_date,
+)
+
+
+def _parse_tally_date(text) -> _dt.date | None:
+    """A BOE date string as a ``date``, or ``None`` when unparseable."""
+    stamp = tally_date(str(text) if text else None)
+    if not stamp:
+        return None
+    try:
+        return _dt.datetime.strptime(stamp, "%Y%m%d").date()
+    except ValueError:
+        return None
 
 source = st.radio(
     "Excel source",
@@ -777,6 +948,33 @@ if computed_for_json is not None:
         p = getattr(rv, "parsed", None)
         return str(p) if isinstance(p, str) else (getattr(rv, "raw_text", "") or "")
 
+    def _lookup(kind: str, *names):
+        """First stored buyer/seller matching any of ``names`` (case-insensitive)."""
+        if store is None:
+            return None
+        finder = store.find_buyer if kind == "buyer" else store.find_seller
+        for name in names:
+            name = (name or "").strip()
+            if not name:
+                continue
+            try:
+                rec = finder(name)
+            except Exception:  # noqa: BLE001 - a lookup failure must not block export
+                return None
+            if rec:
+                return rec
+        return None
+
+    def _auto_buyer() -> CompanyProfile:
+        """Fill buyer identity the document itself cannot carry (gaps only)."""
+        raw = hdr.company_name or ""
+        stripped = raw[4:].strip() if raw[:4].upper() == "M/S " else raw
+        return company_profile_for(hdr, _lookup("buyer", raw, stripped))
+
+    def _auto_seller() -> SellerProfile:
+        """Fill the supplier's country/address when the document omits them."""
+        return seller_profile_for(hdr, _lookup("seller", _rv_text(hdr.party_name)))
+
     with st.expander("Buyer (importer) — from BOE, override if needed", expanded=False):
         buyer_names = []
         if store is not None:
@@ -796,6 +994,15 @@ if computed_for_json is not None:
                     state=rec.state or None,
                     pincode=rec.pincode or None,
                     address_lines=tuple(rec.address_lines) or None,
+                    tax_unit=rec.tax_unit or None,
+                    tally_name=rec.tally_name or None,
+                )
+        elif store is not None:
+            buyer_override = _auto_buyer()
+            if buyer_override != CompanyProfile():
+                st.caption(
+                    f"Matched the stored buyer “{hdr.company_name}” for the fields "
+                    "this sheet does not carry."
                 )
         st.write(
             {
@@ -826,6 +1033,13 @@ if computed_for_json is not None:
                     country=rec.country or None,
                     address_lines=tuple(rec.address_lines) or None,
                 )
+        elif store is not None:
+            seller_override = _auto_seller()
+            if seller_override != SellerProfile():
+                st.caption(
+                    f"Matched the stored supplier “{_rv_text(hdr.party_name)}” for the "
+                    "fields this sheet does not carry."
+                )
         st.write(
             {
                 "Name": seller_override.name or _rv_text(hdr.party_name),
@@ -835,9 +1049,59 @@ if computed_for_json is not None:
             }
         )
 
+# --- Ledger names: this company's real Tally ledgers ---
+# Ledger names are hand-made inside each company's Tally and cannot be derived,
+# so they are looked up per company. A name that is merely *derived* would create
+# a duplicate ledger on import, so any that were derived are called out below.
+ledger_book = LedgerBook()
+if computed_for_json is not None and store is not None:
+    from boe_converter.tally_store import StoreError
+
+    try:
+        ledger_book = LedgerBook.from_records(
+            store.list_ledgers(st.session_state.get("tally_company", ""))
+        )
+    except StoreError as exc:
+        st.error(str(exc))
+
+# --- Cost centre: the consignment code that ties this purchase to its sales ---
+# It appears nowhere on the Bill of Entry, so the parser cannot supply it. On the
+# Excel path it comes from the sheet's "Details" cell; on the direct PDF path only
+# the operator can. Without it the voucher used to go out allocating to a cost
+# centre with no name.
+cost_centre_input = ""
+if computed_for_json is not None:
+    cost_centre_input = st.text_input(
+        "Consignment / cost centre",
+        value=_rv_text(computed_for_json.header.details),
+        placeholder="e.g. CO-04 CTN 1255",
+        help="Tally cost centre for this consignment. The sales vouchers raised "
+        "against the same consignment carry it too, which is what ties them "
+        "together. Leave blank to import the voucher with no cost centre.",
+        key="cost_centre",
+    )
+
+# --- Voucher date: a booking decision, not a fact on the document ---
+voucher_date_str = None
+if computed_for_json is not None:
+    _be = _parse_tally_date(_rv_text(computed_for_json.header.be_date))
+    picked = st.date_input(
+        "Voucher date",
+        value=_be or _dt.date.today(),
+        help="The date the entry is booked under in Tally. Defaults to the Bill of "
+        "Entry date; the supplier invoice keeps its own date on the reference line.",
+        key="voucher_date",
+    )
+    if isinstance(picked, _dt.date):
+        voucher_date_str = picked.strftime("%Y%m%d")
+
 if st.button("Generate Tally JSON", type="primary", disabled=computed_for_json is None):
-    exporter = TallyExporter(company=buyer_override, seller=seller_override)
-    document = exporter.build(computed_for_json, float(rate))
+    exporter = TallyExporter(
+        company=buyer_override, seller=seller_override, ledgers=ledger_book
+    )
+    document = exporter.build(
+        computed_for_json, float(rate), voucher_date_str, cost_centre_input
+    )
     payload = json.dumps(document, ensure_ascii=True, indent=1).encode("utf-8")
     st.success("Tally Purchase-voucher JSON generated.")
     st.download_button(
@@ -846,5 +1110,19 @@ if st.button("Generate Tally JSON", type="primary", disabled=computed_for_json i
         file_name="tally_purchase_voucher.json",
         mime="application/json",
     )
+    if not cost_centre_input.strip():
+        st.info(
+            "No cost centre was given, so this voucher is imported without one. "
+            "Sales vouchers for this consignment will not be tied to it."
+        )
+    derived = exporter.derived_ledger_names(computed_for_json)
+    if derived:
+        st.warning(
+            "These ledger names were **derived** from the usual naming pattern "
+            "because this company has none stored. If they do not match the "
+            "ledgers in your Tally exactly, importing will create duplicates - "
+            "save the real names under “📇 Manage stored data → Ledgers”.\n\n"
+            + "\n".join(f"- `{name}`" for _kind, name in derived)
+        )
     with st.expander("Ledgers used in this voucher"):
         st.table([{"Ledger": n} for n in exporter.required_ledger_names(computed_for_json)])

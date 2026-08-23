@@ -106,8 +106,16 @@ def make_doc(lines: list[ComputedLine], **header_over) -> ComputedDocument:
     return ComputedDocument(header=header, lines=lines, totals=totals, flags=[])
 
 
-def _signed_total(entries: list[dict]) -> float:
-    return sum(float(e["amount"]) for e in entries)
+def _signed_total(entries: list[dict]):
+    """Sum the emitted amount strings exactly, the way Tally reads them.
+
+    Decimal, not float: a purchase voucher has to balance to exactly 0.00 - the
+    tolerances these assertions used to carry were hiding a real one-paisa
+    imbalance, which is invalid double entry.
+    """
+    from decimal import Decimal
+
+    return sum(Decimal(e["amount"]) for e in entries)
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +128,7 @@ def test_voucher_balances_to_zero():
     ])
     out = TallyExporter().build(doc, usd_rate=95.3)
     entries = out["tallymessage"][0]["allledgerentries"]
-    assert abs(_signed_total(entries)) < 0.01
+    assert _signed_total(entries) == 0
 
 
 def test_voucher_groups_ledgers_by_rate():
@@ -258,7 +266,7 @@ def test_excel_reader_reconstructs_lines_without_formulas():
     rebuilt = read_workbook(xlsx)
     assert len(rebuilt.lines) == len(lines)
     entries = TallyExporter().build(rebuilt, 95.3)["tallymessage"][0]["allledgerentries"]
-    assert abs(_signed_total(entries)) < 0.5
+    assert _signed_total(entries) == 0
 
 
 def test_write_tally_names_fills_column_d():
@@ -303,4 +311,4 @@ def test_property_voucher_always_balances(specs):
     ]
     doc = make_doc(lines)
     entries = TallyExporter().build(doc, 95.3)["tallymessage"][0]["allledgerentries"]
-    assert abs(_signed_total(entries)) < 0.05
+    assert _signed_total(entries) == 0

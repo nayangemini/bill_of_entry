@@ -35,6 +35,7 @@ from boe_converter.excel_writer import (
     COL_TOTAL_CUSTOM_DUTY,
     COL_UNIT,
     ITEM_TABLE_FIRST_DATA_ROW,
+    ITEM_TABLE_HEADER_ROW,
 )
 from boe_converter.models import (
     ComputedDocument,
@@ -82,6 +83,7 @@ def read_workbook(raw: bytes) -> ComputedDocument:
     wb = load_workbook(io.BytesIO(raw), data_only=True)
     ws = wb.active
 
+    _check_layout(ws)
     header = _read_header(ws)
 
     lines: list[ComputedLine] = []
@@ -112,12 +114,60 @@ def read_workbook(raw: bytes) -> ComputedDocument:
             "cached), or use the direct 'Generate JSON' option."
         )
 
-    totals = _totals_from_lines(lines)
+    totals = _totals_from_lines(lines, _num(header.invoice_amount.parsed))
     return ComputedDocument(header=header, lines=lines, totals=totals, flags=[])
 
 
 def _is_serial(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 1
+
+
+# Cells whose labels identify a workbook as one this reader can interpret. Every
+# value below is read by *fixed* cell reference, so a sheet with a different
+# layout (a missing column shifts everything left; a taller preamble moves the
+# item table down) would be read cell-for-cell into the wrong fields. Checking
+# the labels first turns that silent corruption into a refusal.
+_HEADER_ANCHORS = (("D1", "Company name"), ("D2", "Party Name"), ("D5", "BE No"))
+_TABLE_ANCHORS = (
+    (COL_SR_NO, "Sr. no."),
+    (COL_AS_PER_TALLY_NAME, "AS PER TALLY NAME"),
+    (COL_DESCRIPTION, "Description"),
+    (COL_HSN_CODE, "HSN CODE"),
+    (COL_AMOUNT, "Amount"),
+)
+
+
+def _label(value) -> str:
+    return value.strip().casefold() if isinstance(value, str) else ""
+
+
+def _check_layout(ws) -> None:
+    """Refuse a workbook whose layout this reader would misread.
+
+    Raises :class:`ExcelReadError` naming the first cell that does not hold the
+    label it must, so the user learns *which* sheet they uploaded rather than
+    receiving a voucher quietly built from the wrong columns.
+    """
+    for ref, expected in _HEADER_ANCHORS:
+        if _label(ws[ref].value) != expected.casefold():
+            raise ExcelReadError(
+                f"This does not look like a CTN workbook produced by this tool: "
+                f"cell {ref} should read {expected!r} but reads "
+                f"{ws[ref].value!r}. Upload the workbook the converter generated "
+                f"(Step 1), not another spreadsheet."
+            )
+    row = ITEM_TABLE_HEADER_ROW
+    for col, expected in _TABLE_ANCHORS:
+        found = ws.cell(row=row, column=col).value
+        if _label(found) != expected.casefold():
+            coord = ws.cell(row=row, column=col).coordinate
+            raise ExcelReadError(
+                f"This workbook's item table does not match the expected layout: "
+                f"cell {coord} should be the {expected!r} column header but reads "
+                f"{found!r}. Its columns would be read into the wrong fields, so "
+                f"the upload was refused. Use the workbook the converter "
+                f"generated in Step 1."
+            )
 
 
 def _read_header(ws) -> HeaderBlock:
@@ -137,7 +187,9 @@ def _read_header(ws) -> HeaderBlock:
         be_date=cell("G5"),
         bl_no=cell("E6"),
         bl_date=cell("G6"),
-        invoice_amount=RawValue.missing(),
+        # G3 is the sheet's "USD Amt" cell - the declared invoice total. It was
+        # previously discarded, which is why the Tally narration read "USD 0.00".
+        invoice_amount=cell("G3"),
         invoice_currency=RawValue.missing(),
         package_count=RawValue.missing(),
         container_details=RawValue.missing(),
@@ -192,6 +244,7 @@ def _read_line(ws, row: int, tally_name, desc) -> tuple[ComputedLine, bool]:
 
     line = ComputedLine(
         source=source,
+        amount_usd=amount_usd,
         purchase_inr=purchase_inr,
         total_customs_duty=duty,
         igst_amount=igst_amt,
@@ -201,8 +254,19 @@ def _read_line(ws, row: int, tally_name, desc) -> tuple[ComputedLine, bool]:
     return line, has_num
 
 
-def _totals_from_lines(lines: list[ComputedLine]) -> Totals:
+def _totals_from_lines(lines: list[ComputedLine], declared_usd: float | None) -> Totals:
+    """Column-wise sums, mirroring what the calculator produces for the PDF path.
+
+    ``total_amount_usd`` drives the Tally narration ("USD 31,453.57 @96.05"), so
+    it is summed from column L. When those cells are blank (a workbook whose
+    formulas were never cached) the header's own ``USD Amt`` cell - ``declared_usd``
+    from G3 - stands in rather than letting the narration print ``USD 0.00``.
+    """
+    total_usd = sum(l.amount_usd or 0.0 for l in lines)
+    if not total_usd and declared_usd:
+        total_usd = declared_usd
     return Totals(
+        total_amount_usd=total_usd,
         total_assessable_value=sum(_num(l.source.assessable_value) or 0.0 for l in lines),
         total_customs_duty=sum(l.total_customs_duty or 0.0 for l in lines),
         total_igst=sum(l.igst_amount or 0.0 for l in lines),

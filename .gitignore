@@ -45,6 +45,12 @@ HUF Master.xlsx
 Impex Stock Master.xlsx
 International Master.xlsx
 LLP Stock Master.xlsx
+# Bill of Entry / invoice documents used while fixing the Tally voucher fields
+229411903072026INNSA1BE0040720261315.pdf
+3. BE  - 221981730062026INNSA1BE0040720261600.pdf
+INV 1054.pdf
+bill_of_entry - corrected copy.xlsx
+bill_of_entry - with mistake.xlsx
 
 # --- Editor / OS ---
 .vscode/

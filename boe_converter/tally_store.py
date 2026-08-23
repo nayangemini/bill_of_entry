@@ -52,6 +52,25 @@ class BuyerRecord:
     state: str = ""
     pincode: str = ""
     address_lines: list[str] = field(default_factory=list)
+    # Per-company Tally identity no document carries.
+    tax_unit: str = ""      # GST registration name, e.g. "Maharashtra Registration"
+    tally_name: str = ""    # Tally company name, e.g. "Acme LLP (F.Y. 2026-27)"
+
+
+@dataclass
+class LedgerRecord:
+    """A saved Tally ledger name for one company.
+
+    ``kind`` is one of ``boe_converter.tally_exporter.LEDGER_KINDS``. ``rate_bp``
+    is the IGST rate in integer basis points (5% -> 500) so a lookup never turns
+    on floating-point equality; the two rate-less ledgers (custom duty, tax free)
+    use 0.
+    """
+
+    company: str = ""
+    kind: str = ""
+    rate_bp: int = 0
+    name: str = ""
 
 
 @dataclass
@@ -165,6 +184,24 @@ class TallyStore:
             address_lines JSONB NOT NULL DEFAULT '[]'::jsonb
         );
         CREATE UNIQUE INDEX IF NOT EXISTS sellers_lname ON sellers (lower(name));
+        -- Per-company Tally identity that no document carries: the GST
+        -- registration (tax unit) name and the Tally company name, which may
+        -- differ from the mailing name by a financial-year suffix.
+        ALTER TABLE buyers ADD COLUMN IF NOT EXISTS tax_unit TEXT NOT NULL DEFAULT '';
+        ALTER TABLE buyers ADD COLUMN IF NOT EXISTS tally_name TEXT NOT NULL DEFAULT '';
+        -- Ledger names are hand-made inside each company's Tally and cannot be
+        -- derived (one company holds "Igst Purchase @18.00%" where the naming
+        -- convention gives "IGST Purchase @ 18.00 %"), so they are stored per
+        -- company and looked up by (kind, rate).
+        CREATE TABLE IF NOT EXISTS ledgers (
+            id SERIAL PRIMARY KEY,
+            company TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL,
+            rate_bp INTEGER NOT NULL DEFAULT 0,
+            name TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS ledgers_company_kind_rate
+            ON ledgers (lower(company), kind, rate_bp);
         """
         self._exec(ddl)
 
@@ -349,7 +386,7 @@ class TallyStore:
     # -- buyers -------------------------------------------------------------
     def list_buyers(self) -> list[BuyerRecord]:
         rows = self._query(
-            "SELECT name, gstin, state, pincode, address_lines "
+            "SELECT name, gstin, state, pincode, address_lines, tax_unit, tally_name "
             "FROM buyers ORDER BY lower(name)"
         )
         return [_row_to_buyer(r) for r in rows]
@@ -358,10 +395,12 @@ class TallyStore:
         if not buyer.name.strip():
             return False
         self._exec(
-            "INSERT INTO buyers (name, gstin, state, pincode, address_lines) "
-            "VALUES (%s, %s, %s, %s, %s::jsonb) "
+            "INSERT INTO buyers (name, gstin, state, pincode, address_lines, "
+            "tax_unit, tally_name) "
+            "VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s) "
             "ON CONFLICT (lower(name)) DO UPDATE SET "
             "gstin = EXCLUDED.gstin, state = EXCLUDED.state, "
+            "tax_unit = EXCLUDED.tax_unit, tally_name = EXCLUDED.tally_name, "
             "pincode = EXCLUDED.pincode, address_lines = EXCLUDED.address_lines",
             (
                 buyer.name.strip(),
@@ -369,6 +408,8 @@ class TallyStore:
                 buyer.state,
                 buyer.pincode,
                 json.dumps(buyer.address_lines),
+                buyer.tax_unit,
+                buyer.tally_name,
             ),
         )
         return True
@@ -378,7 +419,7 @@ class TallyStore:
         rows = [
             (
                 b.name.strip(), b.gstin, b.state, b.pincode,
-                json.dumps(b.address_lines),
+                json.dumps(b.address_lines), b.tax_unit, b.tally_name,
             )
             for b in buyers if b.name.strip()
         ]
@@ -387,10 +428,12 @@ class TallyStore:
         try:
             with self._cursor() as (_conn, cur):
                 cur.executemany(
-                    "INSERT INTO buyers (name, gstin, state, pincode, address_lines) "
-                    "VALUES (%s, %s, %s, %s, %s::jsonb) "
+                    "INSERT INTO buyers (name, gstin, state, pincode, "
+                    "address_lines, tax_unit, tally_name) "
+                    "VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s) "
                     "ON CONFLICT (lower(name)) DO UPDATE SET "
                     "gstin = EXCLUDED.gstin, state = EXCLUDED.state, "
+                    "tax_unit = EXCLUDED.tax_unit, tally_name = EXCLUDED.tally_name, "
                     "pincode = EXCLUDED.pincode, address_lines = EXCLUDED.address_lines",
                     rows,
                 )
@@ -408,11 +451,72 @@ class TallyStore:
 
     def find_buyer(self, name: str) -> BuyerRecord | None:
         rows = self._query(
-            "SELECT name, gstin, state, pincode, address_lines "
+            "SELECT name, gstin, state, pincode, address_lines, tax_unit, tally_name "
             "FROM buyers WHERE lower(name) = lower(%s)",
             (name.strip(),),
         )
         return _row_to_buyer(rows[0]) if rows else None
+
+    # -- ledgers ------------------------------------------------------------
+    def list_ledgers(self, company: str | None = None) -> list[LedgerRecord]:
+        """Stored Tally ledger names, optionally for a single company."""
+        if company is None:
+            rows = self._query(
+                "SELECT company, kind, rate_bp, name FROM ledgers "
+                "ORDER BY lower(company), kind, rate_bp"
+            )
+        else:
+            rows = self._query(
+                "SELECT company, kind, rate_bp, name FROM ledgers "
+                "WHERE lower(company) = lower(%s) ORDER BY kind, rate_bp",
+                (company.strip(),),
+            )
+        return [_row_to_ledger(r) for r in rows]
+
+    def add_ledger(self, ledger: LedgerRecord) -> bool:
+        if not ledger.kind.strip() or not ledger.name.strip():
+            return False
+        self._exec(
+            "INSERT INTO ledgers (company, kind, rate_bp, name) "
+            "VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (lower(company), kind, rate_bp) DO UPDATE SET "
+            "name = EXCLUDED.name",
+            (
+                ledger.company.strip(),
+                ledger.kind.strip(),
+                int(ledger.rate_bp),
+                ledger.name.strip(),
+            ),
+        )
+        return True
+
+    def add_ledgers(self, ledgers) -> int:
+        """Bulk upsert ledger names in ONE connection. Returns rows written."""
+        from psycopg2.extras import execute_values
+
+        rows = [
+            (l.company.strip(), l.kind.strip(), int(l.rate_bp), l.name.strip())
+            for l in ledgers
+            if l.kind.strip() and l.name.strip()
+        ]
+        if not rows:
+            return 0
+        with self._cursor() as (_conn, cur):
+            execute_values(
+                cur,
+                "INSERT INTO ledgers (company, kind, rate_bp, name) VALUES %s "
+                "ON CONFLICT (lower(company), kind, rate_bp) DO UPDATE SET "
+                "name = EXCLUDED.name",
+                rows,
+            )
+        return len(rows)
+
+    def delete_ledger(self, company: str, kind: str, rate_bp: int) -> None:
+        self._exec(
+            "DELETE FROM ledgers WHERE lower(company) = lower(%s) "
+            "AND kind = %s AND rate_bp = %s",
+            (company.strip(), kind.strip(), int(rate_bp)),
+        )
 
     # -- sellers ------------------------------------------------------------
     def list_sellers(self) -> list[SellerRecord]:
@@ -491,6 +595,17 @@ def _row_to_buyer(r: dict) -> BuyerRecord:
         state=r.get("state", "") or "",
         pincode=r.get("pincode", "") or "",
         address_lines=_as_lines(r.get("address_lines")),
+        tax_unit=r.get("tax_unit", "") or "",
+        tally_name=r.get("tally_name", "") or "",
+    )
+
+
+def _row_to_ledger(r: dict) -> LedgerRecord:
+    return LedgerRecord(
+        company=r.get("company", "") or "",
+        kind=r.get("kind", "") or "",
+        rate_bp=int(r.get("rate_bp", 0) or 0),
+        name=r.get("name", "") or "",
     )
 
 
