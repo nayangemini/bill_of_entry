@@ -36,6 +36,7 @@ from boe_converter.excel_writer import (
     COL_UNIT,
     ITEM_TABLE_FIRST_DATA_ROW,
     ITEM_TABLE_HEADER_ROW,
+    read_identity_props,
 )
 from boe_converter.models import (
     ComputedDocument,
@@ -84,7 +85,7 @@ def read_workbook(raw: bytes) -> ComputedDocument:
     ws = wb.active
 
     _check_layout(ws)
-    header = _read_header(ws)
+    header = _read_header(ws, read_identity_props(wb))
 
     lines: list[ComputedLine] = []
     row = ITEM_TABLE_FIRST_DATA_ROW
@@ -170,9 +171,19 @@ def _check_layout(ws) -> None:
             )
 
 
-def _read_header(ws) -> HeaderBlock:
+def _read_header(ws, identity: dict[str, str]) -> HeaderBlock:
+    """Rebuild the header from the sheet's cells plus its identity properties.
+
+    ``identity`` carries the buyer/seller fields the CTN layout has no cells for
+    (GSTIN, state, pincode, country, addresses). A workbook generated before
+    those properties existed simply yields an empty mapping, and every one of
+    those fields stays missing rather than being invented.
+    """
     def cell(ref: str) -> RawValue:
         return _rv(ws[ref].value)
+
+    def ident(name: str) -> RawValue:
+        return _rv(identity.get(name))
 
     usd_rate = _num(ws["G2"].value) or 0.0
     company = ws["E1"].value
@@ -193,6 +204,16 @@ def _read_header(ws) -> HeaderBlock:
         invoice_currency=RawValue.missing(),
         package_count=RawValue.missing(),
         container_details=RawValue.missing(),
+        # Buyer/seller identity the CTN layout has no cells for. Without these
+        # the Tally voucher's countryofresidence / placeofsupply /
+        # consigneestatename go out blank and Tally substitutes its own company
+        # defaults (showing India for an overseas supplier).
+        buyer_gstin=ident("buyer_gstin"),
+        buyer_state=ident("buyer_state"),
+        buyer_pincode=ident("buyer_pincode"),
+        buyer_address=ident("buyer_address"),
+        seller_country=ident("seller_country"),
+        seller_address=ident("seller_address"),
     )
 
 

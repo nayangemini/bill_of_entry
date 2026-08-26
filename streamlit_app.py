@@ -1103,6 +1103,28 @@ if st.button("Generate Tally JSON", type="primary", disabled=computed_for_json i
         computed_for_json, float(rate), voucher_date_str, cost_centre_input
     )
     payload = json.dumps(document, ensure_ascii=True, indent=1).encode("utf-8")
+
+    # A blank identity field is not neutral: Tally fills it with the company's
+    # own defaults on import, so a missing supplier country silently shows as
+    # India and a missing state shows as no place of supply. Say so here rather
+    # than letting a wrong bill be discovered in Tally.
+    _voucher = document["tallymessage"][0]
+    _blank = {
+        "Country (supplier)": "countryofresidence",
+        "Place of supply": "placeofsupply",
+        "Ship-to state": "consigneestatename",
+        "Company GSTIN": "cmpgstin",
+    }
+    _missing = [label for label, key in _blank.items() if not _voucher.get(key)]
+    if _missing:
+        st.warning(
+            "**Tally will substitute its own defaults for: "
+            + ", ".join(_missing)
+            + ".** This Excel carries no buyer/seller identity — it was most "
+            "likely downloaded before that was added. Re-convert the Bill of "
+            "Entry in Step 1 and use the fresh workbook, or pick a stored "
+            "buyer/seller above."
+        )
     st.success("Tally Purchase-voucher JSON generated.")
     st.download_button(
         "⬇ Download Tally voucher JSON",

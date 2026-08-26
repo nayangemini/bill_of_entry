@@ -381,6 +381,7 @@ class ExcelGenerator:
         self._apply_grand_total_fills(ws, totals_row, grand_total_check)
         self._write_aux_templates(ws, shift, totals_row)
         self._write_footer_details(ws, doc.header, shift)
+        write_identity_props(wb, doc.header)
         return wb
 
     # ------------------------------------------------------------------
@@ -919,3 +920,73 @@ class ExcelGenerator:
         """Write ``value`` at ``coordinate`` only when it is not ``None``."""
         if value is not None:
             ws[coordinate] = value
+
+
+# ---------------------------------------------------------------------------
+# Buyer / seller identity carried through the Excel round-trip
+# ---------------------------------------------------------------------------
+# The CTN sheet is a costing table: it has no GSTIN, state or country cells, and
+# adding some would change a layout that is reproduced character-for-character
+# from the sample workbook (and golden-tested). But the *upload an edited Excel*
+# path needs that identity - without it the Tally voucher goes out with a blank
+# ``countryofresidence`` / ``placeofsupply`` / ``consigneestatename``, and Tally
+# fills a blank field with its own company defaults (showing India for a Chinese
+# supplier). So the identity travels as OOXML custom document properties:
+# invisible in the grid, outside every golden-tested cell, unaffected by the
+# one-sheet rule (Req 8.1), and preserved when Excel re-saves the file.
+IDENTITY_PROP_PREFIX = "boe."
+
+# HeaderBlock field name -> document property name.
+IDENTITY_FIELDS: tuple[str, ...] = (
+    "buyer_gstin",
+    "buyer_state",
+    "buyer_pincode",
+    "buyer_address",
+    "seller_country",
+    "seller_address",
+)
+
+
+def _identity_text(rv: RawValue | None) -> str:
+    """A RawValue as plain text for a document property ("" when absent)."""
+    if rv is None or rv.is_missing:
+        return ""
+    parsed = getattr(rv, "parsed", None)
+    if isinstance(parsed, str) and parsed.strip():
+        return parsed.strip()
+    raw = getattr(rv, "raw_text", None)
+    return raw.strip() if isinstance(raw, str) and raw.strip() else ""
+
+
+def write_identity_props(wb: Workbook, header: HeaderBlock) -> None:
+    """Attach the buyer/seller identity to ``wb`` as custom document properties.
+
+    Only fields the document actually carries are written, so a BOE that never
+    stated a value does not gain an empty property.
+    """
+    from openpyxl.packaging.custom import StringProperty
+
+    for field_name in IDENTITY_FIELDS:
+        value = _identity_text(getattr(header, field_name, None))
+        if not value:
+            continue
+        wb.custom_doc_props.append(
+            StringProperty(name=f"{IDENTITY_PROP_PREFIX}{field_name}", value=value)
+        )
+
+
+def read_identity_props(wb: Workbook) -> dict[str, str]:
+    """The identity fields stored on ``wb`` (empty for a pre-change workbook)."""
+    props = getattr(wb, "custom_doc_props", None)
+    if props is None:
+        return {}
+    out: dict[str, str] = {}
+    for prop in props:
+        name = getattr(prop, "name", "") or ""
+        if not name.startswith(IDENTITY_PROP_PREFIX):
+            continue
+        field_name = name[len(IDENTITY_PROP_PREFIX) :]
+        value = getattr(prop, "value", None)
+        if field_name in IDENTITY_FIELDS and isinstance(value, str) and value.strip():
+            out[field_name] = value.strip()
+    return out
