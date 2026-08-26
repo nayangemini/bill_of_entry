@@ -2,6 +2,19 @@
 <!-- Append-only. Newest at TOP. -->
 <!-- Format: ## YYYY-MM-DD HH:MM:SS — <summary> -->
 
+## 2026-08-26 11:06:02 — BUG-002/003/004 reopened and fixed at the real root cause
+**Type:** task-complete
+**Outcome:** The tester reported the three field bugs were still present. They were:
+the earlier change removed the wrong `"India"` default but emitted a blank field, and
+Tally fills a blank field with its own company defaults. The actual cause is that the
+CTN workbook carries no identity cells, so the Excel round-trip dropped buyer GSTIN /
+state and seller country entirely. Identity now travels as OOXML custom document
+properties, leaving the golden-tested layout and the one-sheet rule untouched. Export
+now warns when any field would be left for Tally to default.
+**Open:** the tester must re-download the Excel from Step 1 — workbooks downloaded
+before this change carry no identity and will still export blank (now with a warning).
+**Files changed:** boe_converter/excel_writer.py, boe_converter/excel_reader.py, streamlit_app.py, tests/test_excel_identity_roundtrip.py
+
 ## 2026-08-23 08:28:58 — BOE -> Tally purchase pipeline complete (31/31 fields match Tally)
 **Type:** task-complete
 **Outcome:** Closed the last gap in the purchase pipeline: the cost centre had no

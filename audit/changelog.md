@@ -4,6 +4,50 @@
 
 ---
 
+2026-08-26 11:06:02 - BUG-002/003/004 reopened: carry buyer/seller identity through the Excel round-trip
+
+### Changes
+- The earlier fix removed the hardcoded `"India"` supplier-country fallback but left
+  the field **blank**, which is not a fix: Tally substitutes its own company defaults
+  for a blank field on import, so the bill still showed India for a Chinese supplier
+  and an empty place of supply. The tester was right that nothing had changed.
+- Root cause is one level up. The CTN workbook is a costing table with no GSTIN,
+  state or country cells, so `PDF -> Excel -> re-upload` discarded the buyer and
+  seller identity outright and the exporter had nothing left to emit:
+
+      BEFORE write: gstin=27AAYFG7003K1ZW state=Maharashtra country=China
+      AFTER  read : gstin=None            state=None       country=None
+
+- The workbook now carries that identity as OOXML custom document properties
+  (`write_identity_props` / `read_identity_props`): invisible in the grid, outside
+  every golden-tested cell, unaffected by the one-sheet rule (Req 8.1), and
+  preserved across the load-and-resave the Step 2 name mapping performs. Chosen
+  over visible cells (the layout is reproduced character-for-character from the
+  sample and golden-tested) and over a hidden sheet (`test_e2e_integration.py`
+  asserts `wb.sheetnames == ["Sheet1"]`).
+- Because a blank field fails *silently* in Tally, the app now warns at export time
+  naming each field Tally would substitute a default for.
+
+### Verification
+With no stored buyer/seller configured, the reported path yields
+`countryofresidence=China`, `placeofsupply=Maharashtra`,
+`consigneestatename=Maharashtra`, `cmpgstin=27AAYFG7003K1ZW`.
+Pre-change workbooks still read (identity stays missing, never invented).
+Full suite: 347 passed, 9 skipped.
+
+### Known follow-up
+The GSTIN state-code table now exists twice: `parser._GSTIN_STATE` and
+`tally_exporter._GSTIN_STATE_CODES`. Worth consolidating into a shared module
+alongside `boe_converter/units.py`.
+
+### Files
+- `boe_converter/excel_writer.py` - modified
+- `boe_converter/excel_reader.py` - modified
+- `streamlit_app.py` - modified
+- `tests/test_excel_identity_roundtrip.py` - created
+
+---
+
 2026-08-23 08:28:58 - Complete the BOE -> Tally purchase pipeline: cost centre, party allocation, no nameless allocations
 
 ### Changes
