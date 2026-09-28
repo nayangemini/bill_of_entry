@@ -637,10 +637,30 @@ def _line_rows(computed, tally_map: dict, name_to_display: dict | None = None):
             value = name_to_display.get(mapped)  # None if not in this company
         else:
             value = mapped
+        # Tape override (tape-only, brackets-only): show the PCS qty the
+        # Excel/Tally outputs carry, e.g. ``White Tape (6500pc)`` 456 KG
+        # shows as ``White Tape`` 6500 PCS.
+        from boe_converter.units import tape_pcs_override
+
+        _desc = _num(src.description) or (src.description.raw_text or "")
+        _tape = tape_pcs_override(_desc)
+        if _tape is not None:
+            _desc, _qty = _tape
+            rows.append(
+                {
+                    "Sr": src.item_serial,
+                    "Description": _desc,
+                    "HSN": _num(src.cth_hsn) or (src.cth_hsn.raw_text or ""),
+                    "Qty": f"{_qty:g}",
+                    "Unit": "PCS",
+                    "As per Tally name": value,
+                }
+            )
+            continue
         rows.append(
             {
                 "Sr": src.item_serial,
-                "Description": _num(src.description) or (src.description.raw_text or ""),
+                "Description": _desc,
                 "HSN": _num(src.cth_hsn) or (src.cth_hsn.raw_text or ""),
                 "Qty": _num(src.quantity),
                 "Unit": _num(src.unit) or (src.unit.raw_text or ""),
