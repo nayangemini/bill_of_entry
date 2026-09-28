@@ -21,22 +21,50 @@ from __future__ import annotations
 
 import re
 
-import pdfplumber
-
 from boe_converter.models import RawValue
 
 # Units seen in the invoice's quantity column; used to recognize a data row and
 # to bound the carton column on its right.
 _UNIT_RE = re.compile(r"^[A-Za-z]{2,4}$")
-_UNITS = {"PCS", "DOZ", "KGS", "GRS", "SET", "NOS", "UNT", "MTR", "PRS", "BOX"}
+_UNITS = {
+    "PCS", "PC", "DOZ", "KGS", "KG", "GRS", "SET", "NOS", "EA", "UNT",
+    "MTR", "PRS", "BOX", "MTS", "MT", "CTN", "PKT", "BAG", "ROL", "YDS",
+    "LTR", "SQM", "PAIR",
+}
 
 # Horizontal half-width (points) of the carton column band around the ``CTNS``
 # header token's centre. The invoice's CTNS values sit within ~15pt of the
 # header centre; the quantity column is ~55pt to the right, well outside.
 _CTNS_BAND = 22.0
 
+# Header spellings accepted for the carton column (case-insensitive, trailing
+# punctuation ignored): suppliers print TOTAL CTNS, TOTAL CTN, CTNS. etc.
+_CTNS_TOKENS = {"CTN", "CTNS"}
+
+# Words expected in the table's header row alongside the carton header. Used to
+# prefer the real column header over a stray "CTNS" in title/total text.
+_HEADER_HINTS = {"SR", "NO", "DESCRIPTION", "QTY", "PRICE", "AMOUNT", "UNIT", "UQC"}
+
+# Max gap (points) between two in-band digit tokens for them to count as one
+# value split by the extractor (e.g. "20" read as "2" + "0"). pdfplumber can
+# split wide-tracked digits into separate words; joining only near-adjacent
+# tokens keeps two genuinely separate numbers from merging.
+_DIGIT_JOIN_GAP = 6.0
+
+
+def _header_token(text: str) -> str | None:
+    """The carton-header token in ``text``, else ``None``."""
+    cleaned = text.strip().upper().strip(".,:;")
+    return cleaned if cleaned in _CTNS_TOKENS else None
+
 # A row's SR NO sits in the far-left column.
 _SR_NO_MAX_X = 70.0
+
+
+def _serial_text(text: str) -> int | None:
+    """A serial number from a far-left token (tolerating ``1.``), else ``None``."""
+    cleaned = text.strip().rstrip(".").strip()
+    return int(cleaned) if cleaned.isdigit() else None
 
 
 class InvoicePackingListParser:
@@ -86,6 +114,14 @@ class InvoicePackingListParser:
     def _resolve(doc):
         if hasattr(doc, "pages"):
             return doc, list(doc.pages), False
+        try:
+            import pdfplumber
+        except ImportError as exc:
+            raise ValueError(
+                "pdfplumber is required to read an invoice PDF; "
+                "install it (pip install pdfplumber) or pass an opened "
+                "document with a .pages attribute."
+            ) from exc
         handle = pdfplumber.open(doc)
         return handle, list(handle.pages), True
 
@@ -127,12 +163,27 @@ class InvoicePackingListParser:
         return (float(w["x0"]) + float(w["x1"])) / 2.0
 
     def _ctns_center(self, rows: list[list[dict]]) -> float | None:
-        """Locate the ``CTNS`` header token's horizontal centre on the page."""
+        """Locate the carton column header's horizontal centre on the page.
+
+        Accepts ``CTN``/``CTNS`` in any case with trailing punctuation (suppliers
+        vary the label). When several candidates exist, the one sharing its row
+        with table-header words (SR/NO/DESCRIPTION/QTY/...) wins, so a stray
+        "TOTAL CTNS: 500" in title text cannot hijack the band; otherwise the
+        first candidate is used.
+        """
+        fallback: float | None = None
         for row in rows:
-            for w in row:
-                if w["text"].strip().upper() == "CTNS":
-                    return self._center(w)
-        return None
+            hits = [w for w in row if _header_token(w["text"])]
+            if not hits:
+                continue
+            if fallback is None:
+                fallback = self._center(hits[0])
+            row_words = {
+                w["text"].strip().upper().strip(".,:;") for w in row
+            }
+            if row_words & _HEADER_HINTS:
+                return self._center(hits[0])
+        return fallback
 
     def _parse_page(self, page, details: dict[int, dict]) -> None:
         rows = self._rows(page)
@@ -145,10 +196,11 @@ class InvoicePackingListParser:
 
         for row in rows:
             ordered = sorted(row, key=lambda w: float(w["x0"]))
-            # SR NO: an integer in the far-left column.
+            # SR NO: an integer in the far-left column (tolerating a trailing
+            # dot, e.g. "1." as some invoices print it).
             sr_word = next(
                 (w for w in ordered
-                 if self._center(w) < _SR_NO_MAX_X and w["text"].strip().isdigit()),
+                 if self._center(w) < _SR_NO_MAX_X and _serial_text(w["text"]) is not None),
                 None,
             )
             if sr_word is None:
@@ -163,18 +215,24 @@ class InvoicePackingListParser:
             if not has_unit:
                 continue
 
-            serial = int(sr_word["text"].strip())
+            serial = _serial_text(sr_word["text"])
+            assert serial is not None
             entry = details.setdefault(serial, {"cartons": None, "description": None})
 
-            # Carton count: a numeric token whose centre falls in the CTNS band.
-            ctn_word = next(
-                (w for w in ordered
-                 if lo <= self._center(w) <= hi
-                 and self._is_number(w["text"])),
-                None,
-            )
-            if ctn_word is not None:
-                entry["cartons"] = self._carton_value(ctn_word["text"].strip())
+            # Carton count: numeric token(s) whose centre falls in the CTNS
+            # band. Adjacent digit tokens are joined first: extractors can
+            # split "20" into "2" + "0", and taking the first token turned
+            # 20 into 2. Only near-adjacent tokens merge, so genuinely
+            # separate numbers never combine.
+            ctn_words = [
+                w for w in ordered
+                if lo <= self._center(w) <= hi
+                and self._is_number(w["text"])
+            ]
+            if ctn_words:
+                entry["cartons"] = self._carton_value(
+                    self._join_number_tokens(ctn_words)
+                )
 
             # Description: all tokens between the SR NO column and the CTNS band,
             # left-to-right (e.g. "SLIDERS (GARMENT ACCESSORY)").
@@ -189,6 +247,25 @@ class InvoicePackingListParser:
     @staticmethod
     def _is_number(text: str) -> bool:
         return bool(re.fullmatch(r"\d+(?:\.\d+)?", text.strip().replace(",", "")))
+
+    @staticmethod
+    def _join_number_tokens(words: list[dict]) -> str:
+        """Join in-band number tokens split by the extractor into one value.
+
+        Tokens are ordered left-to-right and merged while the gap between one
+        token's end and the next token's start stays within
+        ``_DIGIT_JOIN_GAP``. The first group wins: a row carries a single
+        carton value, so extra far-apart groups are stray marks, not data.
+        """
+        ranked = sorted(words, key=lambda w: (float(w["x0"]) + float(w["x1"])) / 2.0)
+        groups: list[list[dict]] = [[ranked[0]]]
+        for w in ranked[1:]:
+            prev = groups[-1][-1]
+            if float(w["x0"]) - float(prev["x1"]) <= _DIGIT_JOIN_GAP:
+                groups[-1].append(w)
+            else:
+                groups.append([w])
+        return "".join(w["text"].strip() for w in groups[0])
 
     @staticmethod
     def _carton_value(text: str) -> RawValue:

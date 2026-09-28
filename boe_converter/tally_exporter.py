@@ -47,7 +47,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 
 from boe_converter.models import ComputedDocument, ComputedLine, HeaderBlock, RawValue
-from boe_converter.units import UNIT_TO_PCS, pcs_factor
+from boe_converter.units import UNIT_TO_PCS, convert_to_kgs, pcs_factor, tape_pcs_override
 
 # ---------------------------------------------------------------------------
 # Pure Tally structural constants (never printed on a BOE)
@@ -272,6 +272,17 @@ def _convert_to_pcs(qty: float, unit: str) -> tuple[float, str]:
     return qty, unit
 
 
+def _convert_qty_unit(qty: float, unit: str) -> tuple[float, str]:
+    """Convert MTS to KGS first, then DOZ/GRS/THD to PCS.
+
+    MTS (any case) becomes KGS at 1000 per MTS so Tally receives the stock
+    unit; all other units keep existing behaviour. Amount is preserved by
+    callers; only qty/unit/rate change.
+    """
+    qty, unit = convert_to_kgs(qty, unit)
+    return _convert_to_pcs(qty, unit)
+
+
 # ---------------------------------------------------------------------------
 # Ledger-name conventions (deterministic; no master file needed)
 # ---------------------------------------------------------------------------
@@ -437,10 +448,28 @@ def _line_igst_fraction(line: ComputedLine) -> float:
 def _stock_name(line: ComputedLine) -> str:
     """Stock item name: the BOE description (Excel col D is filled by a human).
 
+    Tape items carrying their piece count in brackets, e.g.
+    ``White Tape (6500pc)``, use the stripped base name (``White Tape``).
     When a mapped Tally name is later supplied via the Excel upload path it can
     override this; from the in-memory document the verbatim description is used.
     """
-    return _text(line.source.description) or f"ITEM {line.source.item_serial}"
+    text = _text(line.source.description)
+    if text:
+        tape = tape_pcs_override(text)
+        if tape is not None:
+            return tape[0]
+    return text or f"ITEM {line.source.item_serial}"
+
+
+def _tape_qty_unit(line: ComputedLine) -> tuple[float, str] | None:
+    """(NNN, PCS) when the line is a tape item with a bracketed pc count."""
+    text = _text(line.source.description)
+    if not text:
+        return None
+    tape = tape_pcs_override(text)
+    if tape is None:
+        return None
+    return tape[1], "PCS"
 
 
 # ---------------------------------------------------------------------------
@@ -735,8 +764,14 @@ class TallyExporter:
         raw_unit = _text(line.source.unit) or "NOS"
         raw_qty = _num(line.source.quantity) or 0.0
         amount = line.land_cost_excl_gst or 0.0
-        # Convert dozens/gross/thousand to pieces; keep the amount, adjust rate.
-        qty, unit = _convert_to_pcs(raw_qty, raw_unit)
+        # Tape override first: (NNNpc) in a tape name books NNN PCS with
+        # rate = amount / NNN. Then MTS to KGS, then dozens/gross/thousand to
+        # pieces; keep the amount, adjust rate.
+        _tape = _tape_qty_unit(line)
+        if _tape is not None:
+            qty, unit = _tape
+        else:
+            qty, unit = _convert_qty_unit(raw_qty, raw_unit)
         unit_rate = (amount / qty) if qty else 0.0
         pct = _pct(rate)
         half = round(pct / 2, 2)
@@ -817,7 +852,11 @@ class TallyExporter:
         raw_unit = _text(line.source.unit) or "NOS"
         raw_qty = _num(line.source.quantity) or 0.0
         amount = line.land_cost_excl_gst or 0.0
-        qty, unit = _convert_to_pcs(raw_qty, raw_unit)
+        _tape = _tape_qty_unit(line)
+        if _tape is not None:
+            qty, unit = _tape
+        else:
+            qty, unit = _convert_qty_unit(raw_qty, raw_unit)
         unit_rate = (amount / qty) if qty else 0.0
         return {
             "stockitemname": name,
