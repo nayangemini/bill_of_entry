@@ -623,9 +623,25 @@ class ExcelGenerator:
         # G: per-line CTN - populated from the supplier invoice when supplied,
         # otherwise blank (the BOE itself has no per-line carton count).
         self._set_cell(ws, row, COL_CTN, _raw_cell_value(item.cartons))
-        self._set_cell(ws, row, COL_QTY, _raw_cell_value(item.quantity))
-        self._set_cell(ws, row, COL_UNIT, _raw_cell_value(item.unit))
-        self._set_cell(ws, row, COL_UNIT_PRICE_USD, _raw_cell_value(item.unit_price_usd))
+        # H/I/K: a line booked under a different quantity than the BOE prints
+        # (MTS -> KGS, a weighed tape line -> its piece count; decided by the
+        # calculator) writes that quantity and unit, so the workbook matches the
+        # Tally stock unit. Amounts are unchanged, so K (UPI) becomes
+        # amount_usd / qty to keep L = H*K true; it is blank when the amount is
+        # missing (Req 6.13). Every other line is written verbatim.
+        if line.stock_qty is not None:
+            self._set_cell(ws, row, COL_QTY, line.stock_qty)
+            self._set_cell(ws, row, COL_UNIT, line.stock_unit)
+            unit_price = (
+                line.amount_usd / line.stock_qty
+                if line.amount_usd is not None and line.stock_qty
+                else None
+            )
+            self._set_cell(ws, row, COL_UNIT_PRICE_USD, unit_price)
+        else:
+            self._set_cell(ws, row, COL_QTY, _raw_cell_value(item.quantity))
+            self._set_cell(ws, row, COL_UNIT, _raw_cell_value(item.unit))
+            self._set_cell(ws, row, COL_UNIT_PRICE_USD, _raw_cell_value(item.unit_price_usd))
         self._set_cell(ws, row, COL_CUSTOM_ASS_VALUE, _raw_cell_value(item.assessable_value))
         # Direct (verbatim) rate values. BOE rates are stored as fractions
         # (e.g. 0.075 for 7.5%). The template's whole-percent format rounds
@@ -656,7 +672,7 @@ class ExcelGenerator:
         # written. A ``None`` computed value (missing/non-numeric input, Req
         # 6.13) leaves the cell blank in both modes so the formula never turns a
         # missing input into a spurious 0.
-        qty = _raw_number(item.quantity)
+        qty = line.stock_qty if line.stock_qty is not None else _raw_number(item.quantity)
         # pcs = qty * pcs_factor(unit); the factor comes from the shared units
         # table via the calculator (DOZ=12, GRS=144, THD=1000). Render it without
         # a trailing .0 for whole numbers (via _num) so the formula reads
@@ -686,7 +702,9 @@ class ExcelGenerator:
             ws, row, COL_LAND_COST_WITH_GST, line.land_cost_incl_gst, f"=M{row}+S{row}"
         )
         # Y = O/H; guard the qty==0 case (calculator yields 0) so the formula
-        # never produces a #DIV/0! error in the workbook.
+        # never produces a #DIV/0! error in the workbook. ``qty`` is what H
+        # holds (the booking quantity), which is also the calculator's divisor,
+        # so the formula and the literal agree.
         if line.purchase_rate_per_unit is not None and self.use_formulas and qty not in (None, 0):
             ws.cell(row=row, column=COL_RATE_PER_UNIT, value=f"=O{row}/H{row}")
         else:
