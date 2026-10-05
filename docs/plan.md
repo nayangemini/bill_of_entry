@@ -1,5 +1,61 @@
 # Plan
 
+---
+
+2026-10-05 14:50:00 - Fix the review findings on PR #2 (MTS unit, tape pc override, invoice cartons) before merging it
+
+### Context
+PR #2 (nayangemini, `mts-tape-carton-fixes`) was reviewed and tested. Its claims hold
+and it breaks nothing existing (347 passed / 9 skipped on both `main` and the PR; the
+two real invoices parse identically), but the tape override is wrong in the default
+Tally path. On the real bill (`old_format_pdf.pdf` line 8, `PTFE TEFLON TAPE (26880 pc)`,
+272 KGS) the Excel shows 26880 PCS while the Tally JSON books 272.00 KGS as soon as the
+line is mapped to a Tally name in Step 2. The user chose "fix it, then merge".
+
+Root cause: the override is re-derived from the description string in three
+presentation layers (Excel writer, Tally exporter, Step-2 editor). Step 2 replaces the
+description with the mapped Tally name, so the exporter no longer sees the bracket. The
+same string-parsing also fires on human-chosen Tally master names and on any word
+containing "tape" (`TAPERED ROLLER BEARING (50PCS)`).
+
+### Approach
+- Decide the booking quantity **once**, in `ValueCalculator`, and carry it on the
+  `ComputedLine` (`stock_qty` / `stock_unit`). The tape base name replaces the line's
+  description at the same point. Excel, Tally and the editor read those fields; none of
+  them parses a description any more, so name mapping cannot drop the override and a
+  Tally master name is never altered.
+- Tighten the tape rule in `units.py`: whole word `tape`/`tapes`, only when the BOE
+  declares the line by weight, comma-grouped counts accepted, zero ignored.
+- Round the MTS -> KGS product so `1.005 MTS` is `1005`, not `1004.9999999999999`.
+- Invoice parser, two conservative guards for behaviour the PR newly exposes: a serial
+  captured once is final and only rows below the column header are table rows (numbered
+  notes can no longer overwrite a line); the carton header is never taken from a data
+  row or from below the table body.
+- Tests first for every change, plus tests pinning the PR's own claimed behaviour, which
+  it shipped without any.
+
+Chosen over patching `_apply_name_overrides` to preserve the bracket: that would keep
+three parsers in sync by convention and leave the master-name misfire in place.
+
+### Tradeoffs
+- `ComputedLine.source.description` is no longer verbatim for an overridden tape line
+  (it holds the base name). The orchestrator already replaces descriptions from the
+  invoice, so this follows existing practice.
+- The weight-unit gate means a tape line declared in DOZ/NOS/ROL keeps its BOE quantity.
+  That is the safe failure (today's behaviour) rather than a silent replacement.
+- Not changed: the 6pt digit-join threshold and the row-stitching rule. Both were tuned
+  on the contributor's live bills, which are not available here to re-verify against.
+- Tracking entries stay out of the PR (local `main` carries an unpushed docs commit that
+  touches the same files).
+
+### Checklist
+- [x] `units.py`: tape rule, `stock_quantity`, rounding (tests first)
+- [x] `ValueCalculator`: `stock_qty` / `stock_unit`, base name, per-unit rate
+- [x] Excel writer, Tally exporter, Step-2 editor read the line fields
+- [x] Invoice parser guards
+- [x] Full suite, PR-claim tests, real-document main-vs-PR comparison
+- [x] Push to the PR branch, merge PR #2
+
 ## 2026-08-22 — Make the Tally export generic across companies (decisions from the CO-04 data set)
 
 ### What the CO-04 data proved

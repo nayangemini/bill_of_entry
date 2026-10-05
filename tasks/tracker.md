@@ -2,6 +2,21 @@
 <!-- Append-only. Newest at TOP. -->
 <!-- Format: ## YYYY-MM-DD HH:MM:SS — <summary> -->
 
+## 2026-10-05 19:30:03 — Reviewed, fixed and merged PR #2 (MTS unit, tape pc override, invoice cartons)
+**Type:** task-complete
+**Outcome:** PR #2 from nayangemini is merged into `main` (`27c297c`). Review confirmed
+its claims but found the tape override was lost in the default Tally path once a line
+was mapped in Step 2 (Excel 26880 PCS, Tally 272 KGS on the real bill), and that the
+rule fired on any word containing "tape", on lines already declared in pieces, and on
+chosen Tally master names. Fixed on the PR branch before merging (`0136a0a`): the
+booking quantity is decided once in the calculator and carried on the line; the tape
+rule needs the whole word and a weight unit; two guards added to the invoice row
+parser. 92 tests added; full suite 439 passed, 9 skipped; real bills differ from the
+previous `main` only on the weighed tape line.
+**Open:** the digit-join threshold and row-stitching rule were not changed (need the
+contributor's live bills to re-verify).
+**Files changed:** boe_converter/units.py, boe_converter/models.py, boe_converter/calculator.py, boe_converter/excel_writer.py, boe_converter/tally_exporter.py, boe_converter/invoice_parser.py, streamlit_app.py, tests/test_units.py, tests/test_stock_quantity.py, tests/test_invoice_row_parsing.py
+
 ## 2026-08-26 11:06:02 — BUG-002/003/004 reopened and fixed at the real root cause
 **Type:** task-complete
 **Outcome:** The tester reported the three field bugs were still present. They were:
