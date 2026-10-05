@@ -20,9 +20,15 @@ Normative formulas (design.md -> Computation model):
     land_cost_incl_gst     = land_cost_excl_gst + igst_amount
     purchase_rate_per_unit = land_cost_excl_gst / qty   (= 0 when qty == 0)
     pcs                    = qty * pcs_factor(unit)   (DOZ=12, GRS=144, THD=1000)
+
+``qty`` in ``purchase_rate_per_unit`` is the line's booking quantity: the BOE
+quantity, except for the lines :func:`boe_converter.units.stock_quantity`
+re-expresses (MTS -> KGS, a weighed tape line -> its piece count).
 """
 
 from __future__ import annotations
+
+from dataclasses import replace
 
 from boe_converter import units
 from boe_converter.models import (
@@ -232,12 +238,26 @@ class ValueCalculator:
             if land_cost_excl_gst is not None and igst_amount is not None
             else None
         )
-        purchase_rate_per_unit = self._purchase_rate_per_unit(qty, land_cost_excl_gst)
+        # Booking quantity: MTS books as KGS, and a weighed tape line whose name
+        # carries its piece count (``White Tape (6500pc)``) books that count in
+        # PCS under the base name. Decided here, once, so every output agrees;
+        # no monetary value changes - only the per-unit rate's divisor.
+        stock = units.stock_quantity(
+            _unit_text(item.description), qty, _unit_text(item.unit)
+        )
+        source = item
+        if stock is not None and stock.name is not None:
+            source = replace(
+                item, description=RawValue(raw_text=stock.name, parsed=stock.name)
+            )
+        purchase_rate_per_unit = self._purchase_rate_per_unit(
+            stock.qty if stock is not None else qty, land_cost_excl_gst
+        )
         pcs_factor = units.pcs_factor(_unit_text(item.unit))
         pcs = self._pcs(item.unit, qty)
 
         line = ComputedLine(
-            source=item,
+            source=source,
             amount_usd=amount_usd,
             purchase_inr=purchase_inr,
             cust_aidc=cust_aidc,
@@ -250,6 +270,8 @@ class ValueCalculator:
             pcs=pcs,
             pcs_factor=pcs_factor,
             purchase_rate_per_unit=purchase_rate_per_unit,
+            stock_qty=stock.qty if stock is not None else None,
+            stock_unit=stock.unit if stock is not None else None,
         )
         return line, flags
 

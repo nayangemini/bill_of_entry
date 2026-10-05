@@ -275,42 +275,57 @@ class InvoicePackingListParser:
 
     @staticmethod
     def _center(w: dict) -> float:
-        return (float(w["x0"]) + float(w["x1"])) / 2.0
+        return _xcenter(w)
 
-    def _ctns_center(self, rows: list[list[dict]]) -> float | None:
-        """Locate the carton column header's horizontal centre on the page.
+    def _ctns_header(self, rows: list[list[dict]]) -> tuple[int, float] | None:
+        """Locate the carton column header: ``(row index, horizontal centre)``.
 
         Accepts ``CTN``/``CTNS`` in any case with trailing punctuation (suppliers
         vary the label). When several candidates exist, the one sharing its row
         with table-header words (SR/NO/DESCRIPTION/QTY/...) wins, so a stray
         "TOTAL CTNS: 500" in title text cannot hijack the band; otherwise the
         first candidate is used.
+
+        A header has line items beneath it, so only rows above the page's last
+        line item are candidates - a footer ("TOTAL CTNS: 1159 TOTAL QTY 4500")
+        cannot displace a header printed on a row of its own. A row carrying a
+        serial is a line item, never the header: ``CTN`` is also a unit, so a
+        data row would otherwise qualify.
         """
-        fallback: float | None = None
-        for row in rows:
+        last_item = max(
+            (i for i, row in enumerate(rows) if _row_has_sr(row) and _row_has_unit(row)),
+            default=0,
+        )
+        hinted: list[tuple[int, float]] = []
+        plain: list[tuple[int, float]] = []
+        for index, row in enumerate(rows[:last_item]):
+            if _row_has_sr(row):
+                continue
             hits = [w for w in row if _header_token(w["text"])]
             if not hits:
                 continue
-            if fallback is None:
-                fallback = self._center(hits[0])
             row_words = {
                 w["text"].strip().upper().strip(".,:;") for w in row
             }
-            if row_words & _HEADER_HINTS:
-                return self._center(hits[0])
-        return fallback
+            found = (index, self._center(hits[0]))
+            (hinted if row_words & _HEADER_HINTS else plain).append(found)
+        candidates = hinted + plain
+        return candidates[0] if candidates else None
 
     def _parse_page(self, page, details: dict[int, dict]) -> None:
         rows = self._rows(page)
         rows = _stitch_split_rows(rows)
-        ctns_center = self._ctns_center(rows)
-        if ctns_center is None:
+        header = self._ctns_header(rows)
+        if header is None:
             return
+        header_index, ctns_center = header
         lo, hi = ctns_center - _CTNS_BAND, ctns_center + _CTNS_BAND
         # The description column sits between the SR NO column and the CTNS band.
         desc_hi = ctns_center - _CTNS_BAND
 
-        for row in rows:
+        # The table sits below its column header; anything above it (letterhead,
+        # addresses) is not a line item even when it starts with a number.
+        for row in rows[header_index + 1:]:
             ordered = sorted(row, key=lambda w: float(w["x0"]))
             # Matching sees through fused number+unit tokens (4000THD); the
             # captured description below always uses the original words.
@@ -331,7 +346,12 @@ class InvoicePackingListParser:
 
             serial = _serial_text(sr_word["text"])
             assert serial is not None
-            entry = details.setdefault(serial, {"cartons": None, "description": None})
+            # A serial is captured once. A numbered note below the table
+            # ("1. PACKING: 20 PCS PER CTN") reads as serial 1 with a unit; it
+            # must not replace the real line 1, on this page or an earlier one.
+            if serial in details:
+                continue
+            entry = details[serial] = {"cartons": None, "description": None}
 
             # Carton count: numeric token(s) whose centre falls in the CTNS
             # band. Adjacent digit tokens are joined first: extractors can
@@ -373,7 +393,7 @@ class InvoicePackingListParser:
         ``_DIGIT_JOIN_GAP``. The first group wins: a row carries a single
         carton value, so extra far-apart groups are stray marks, not data.
         """
-        ranked = sorted(words, key=lambda w: (float(w["x0"]) + float(w["x1"])) / 2.0)
+        ranked = sorted(words, key=_xcenter)
         groups: list[list[dict]] = [[ranked[0]]]
         for w in ranked[1:]:
             prev = groups[-1][-1]

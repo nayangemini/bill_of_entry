@@ -60,7 +60,6 @@ from boe_converter.models import (
     ReviewFlagSet,
     Totals,
 )
-from boe_converter.units import kgs_factor, tape_pcs_override
 
 # The bundled golden workbook used as the *style template*: it carries the
 # sample's exact column widths, row heights, merged ranges, fonts, fills,
@@ -276,48 +275,6 @@ def _raw_number(rv: RawValue | None) -> float | None:
     if isinstance(parsed, (int, float)):
         return float(parsed)
     return None
-
-
-def _unit_text(rv: RawValue | None) -> str | None:
-    """Unit text, preferring the parsed interpretation."""
-    if rv is None:
-        return None
-    if isinstance(rv.parsed, str):
-        return rv.parsed
-    return rv.raw_text
-
-
-def _desc_text(rv: RawValue | None) -> str | None:
-    """Description text, preferring the parsed interpretation."""
-    if rv is None:
-        return None
-    if isinstance(rv.parsed, str):
-        return rv.parsed
-    return rv.raw_text
-
-
-def _qty_cell_value(qty: RawValue | None, unit: RawValue | None) -> object | None:
-    """QTY cell value, converting MTS to KGS (qty * 1000)."""
-    base = _raw_cell_value(qty)
-    if base is None or isinstance(base, str):
-        return base
-    factor = kgs_factor(_unit_text(unit))
-    if factor is not None:
-        return float(base) * factor
-    return base
-
-
-def _unit_cell_value(unit: RawValue | None) -> object | None:
-    """Unit cell value, normalising MTS (any case) to KGS."""
-    if unit is None or unit.is_missing:
-        return None
-    if unit.is_unparseable:
-        return unit.raw_text
-    if kgs_factor(_unit_text(unit)) is not None:
-        return "KGS"
-    if unit.parsed is not None:
-        return unit.parsed
-    return unit.raw_text
 
 
 def _sum_optional(values) -> float:
@@ -661,55 +618,30 @@ class ExcelGenerator:
         ws.cell(row=row, column=COL_SR_NO, value=sr_no)
 
         # Direct (verbatim) values.
-        # Tape override (tape-only, brackets-only): e.g. ``White Tape (6500pc)``
-        # with 456 KG books 6500 PCS as ``White Tape``; rate = amount / NNN.
-        # Amounts are preserved, only qty/unit/rate change. Takes precedence
-        # over the MTS->KGS path below.
-        tape = tape_pcs_override(_desc_text(item.description))
-        if tape is not None:
-            tape_name, tape_qty = tape
-            self._set_cell(ws, row, COL_DESCRIPTION, tape_name)
-        else:
-            self._set_cell(ws, row, COL_DESCRIPTION, _raw_cell_value(item.description))
+        self._set_cell(ws, row, COL_DESCRIPTION, _raw_cell_value(item.description))
         self._set_cell(ws, row, COL_HSN_CODE, _raw_cell_value(item.cth_hsn))
         # G: per-line CTN - populated from the supplier invoice when supplied,
         # otherwise blank (the BOE itself has no per-line carton count).
         self._set_cell(ws, row, COL_CTN, _raw_cell_value(item.cartons))
-        # H/I (+K knock-on): Tape override first (6500 PCS); then MTS converts
-        # to KGS at 1000 per MTS so the workbook matches the Tally stock unit.
-        # Amounts are preserved, only qty/unit/rate change - so K (UPI) becomes
-        # amount_usd/converted_qty, keeping L=H*K exact. All other units
-        # (KG/KGS, NOS, PCS, DOZ, ...) are written verbatim.
-        # alt_qty/alt_rate carry a converted qty + per-unit land rate for Y.
-        alt_qty: float | None = None
-        alt_rate: float | None = None
-        alt_active = False
-        if tape is not None:
-            tape_name, tape_qty = tape
-            self._set_cell(ws, row, COL_QTY, tape_qty)
-            self._set_cell(ws, row, COL_UNIT, "PCS")
-            # K (UPI) per-pc so L=H*K still yields the line amount:
-            # K = amount_usd / NNN. Blank when amount is missing (Req 6.13).
-            if line.amount_usd is not None and tape_qty:
-                self._set_cell(ws, row, COL_UNIT_PRICE_USD, line.amount_usd / tape_qty)
-            else:
-                self._set_cell(ws, row, COL_UNIT_PRICE_USD, None)
+        # H/I/K: a line booked under a different quantity than the BOE prints
+        # (MTS -> KGS, a weighed tape line -> its piece count; decided by the
+        # calculator) writes that quantity and unit, so the workbook matches the
+        # Tally stock unit. Amounts are unchanged, so K (UPI) becomes
+        # amount_usd / qty to keep L = H*K true; it is blank when the amount is
+        # missing (Req 6.13). Every other line is written verbatim.
+        if line.stock_qty is not None:
+            self._set_cell(ws, row, COL_QTY, line.stock_qty)
+            self._set_cell(ws, row, COL_UNIT, line.stock_unit)
+            unit_price = (
+                line.amount_usd / line.stock_qty
+                if line.amount_usd is not None and line.stock_qty
+                else None
+            )
+            self._set_cell(ws, row, COL_UNIT_PRICE_USD, unit_price)
         else:
-            self._set_cell(ws, row, COL_QTY, _qty_cell_value(item.quantity, item.unit))
-            self._set_cell(ws, row, COL_UNIT, _unit_cell_value(item.unit))
-            qty_num = _raw_number(item.quantity)
-            factor = kgs_factor(_unit_text(item.unit))
-            if factor is not None and qty_num is not None:
-                conv = qty_num * factor
-                if line.amount_usd is not None and conv:
-                    self._set_cell(ws, row, COL_UNIT_PRICE_USD, line.amount_usd / conv)
-                else:
-                    self._set_cell(ws, row, COL_UNIT_PRICE_USD, None)
-                alt_qty, alt_active = conv, True
-                if line.land_cost_excl_gst is not None:
-                    alt_rate = line.land_cost_excl_gst / conv if conv else 0
-            else:
-                self._set_cell(ws, row, COL_UNIT_PRICE_USD, _raw_cell_value(item.unit_price_usd))
+            self._set_cell(ws, row, COL_QTY, _raw_cell_value(item.quantity))
+            self._set_cell(ws, row, COL_UNIT, _raw_cell_value(item.unit))
+            self._set_cell(ws, row, COL_UNIT_PRICE_USD, _raw_cell_value(item.unit_price_usd))
         self._set_cell(ws, row, COL_CUSTOM_ASS_VALUE, _raw_cell_value(item.assessable_value))
         # Direct (verbatim) rate values. BOE rates are stored as fractions
         # (e.g. 0.075 for 7.5%). The template's whole-percent format rounds
@@ -740,6 +672,7 @@ class ExcelGenerator:
         # written. A ``None`` computed value (missing/non-numeric input, Req
         # 6.13) leaves the cell blank in both modes so the formula never turns a
         # missing input into a spurious 0.
+        qty = line.stock_qty if line.stock_qty is not None else _raw_number(item.quantity)
         # pcs = qty * pcs_factor(unit); the factor comes from the shared units
         # table via the calculator (DOZ=12, GRS=144, THD=1000). Render it without
         # a trailing .0 for whole numbers (via _num) so the formula reads
@@ -769,29 +702,11 @@ class ExcelGenerator:
             ws, row, COL_LAND_COST_WITH_GST, line.land_cost_incl_gst, f"=M{row}+S{row}"
         )
         # Y = O/H; guard the qty==0 case (calculator yields 0) so the formula
-        # never produces a #DIV/0! error in the workbook. Under the tape
-        # override H is NNN, so Y is per-pc (land_excl / NNN); the formula
-        # needs no change, but the literal fallback must use NNN, not the
-        # per-kg calculator value.
-        if tape is not None:
-            tape_name, tape_qty = tape
-            eff_qty: float | None = tape_qty
-            tape_rate = (
-                line.land_cost_excl_gst / tape_qty
-                if line.land_cost_excl_gst is not None and tape_qty
-                else (0 if tape_qty == 0 and line.land_cost_excl_gst is not None else None)
-            )
-        elif alt_active:
-            eff_qty = alt_qty
-        else:
-            eff_qty = _raw_number(item.quantity)
-            tape_rate = None
-        if line.purchase_rate_per_unit is not None and self.use_formulas and eff_qty not in (None, 0):
+        # never produces a #DIV/0! error in the workbook. ``qty`` is what H
+        # holds (the booking quantity), which is also the calculator's divisor,
+        # so the formula and the literal agree.
+        if line.purchase_rate_per_unit is not None and self.use_formulas and qty not in (None, 0):
             ws.cell(row=row, column=COL_RATE_PER_UNIT, value=f"=O{row}/H{row}")
-        elif tape is not None:
-            self._set_cell(ws, row, COL_RATE_PER_UNIT, tape_rate)
-        elif alt_active:
-            self._set_cell(ws, row, COL_RATE_PER_UNIT, alt_rate)
         else:
             self._set_cell(ws, row, COL_RATE_PER_UNIT, line.purchase_rate_per_unit)
 
