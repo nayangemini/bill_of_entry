@@ -47,7 +47,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 
 from boe_converter.models import ComputedDocument, ComputedLine, HeaderBlock, RawValue
-from boe_converter.units import UNIT_TO_PCS, pcs_factor
+from boe_converter.units import UNIT_TO_PCS, convert_to_kgs, pcs_factor
 
 # ---------------------------------------------------------------------------
 # Pure Tally structural constants (never printed on a BOE)
@@ -272,6 +272,17 @@ def _convert_to_pcs(qty: float, unit: str) -> tuple[float, str]:
     return qty, unit
 
 
+def _convert_qty_unit(qty: float, unit: str) -> tuple[float, str]:
+    """Convert MTS to KGS first, then DOZ/GRS/THD to PCS.
+
+    MTS (any case) becomes KGS at 1000 per MTS so Tally receives the stock
+    unit; all other units keep existing behaviour. Amount is preserved by
+    callers; only qty/unit/rate change.
+    """
+    qty, unit = convert_to_kgs(qty, unit)
+    return _convert_to_pcs(qty, unit)
+
+
 # ---------------------------------------------------------------------------
 # Ledger-name conventions (deterministic; no master file needed)
 # ---------------------------------------------------------------------------
@@ -439,8 +450,26 @@ def _stock_name(line: ComputedLine) -> str:
 
     When a mapped Tally name is later supplied via the Excel upload path it can
     override this; from the in-memory document the verbatim description is used.
+    The name is never rewritten here: by this point it may be a Tally master
+    name chosen in Step 2.
     """
     return _text(line.source.description) or f"ITEM {line.source.item_serial}"
+
+
+def _booking_qty_unit(line: ComputedLine) -> tuple[float, str]:
+    """The ``(qty, unit)`` a line is booked under in Tally.
+
+    A line the calculator re-expressed (MTS -> KGS, a weighed tape line -> its
+    piece count in PCS) carries that on ``stock_qty``/``stock_unit``. It is read
+    from the line, not re-derived from the description, because Step 2 replaces
+    the description with the mapped Tally name. Any other line books its BOE
+    quantity, converting MTS to KGS and dozens/gross/thousand to pieces.
+    """
+    if line.stock_qty is not None and line.stock_unit:
+        return line.stock_qty, line.stock_unit
+    raw_unit = _text(line.source.unit) or "NOS"
+    raw_qty = _num(line.source.quantity) or 0.0
+    return _convert_qty_unit(raw_qty, raw_unit)
 
 
 # ---------------------------------------------------------------------------
@@ -732,11 +761,10 @@ class TallyExporter:
     def _inventory(self, line: ComputedLine, rate: float, cost_centre: str) -> dict:
         name = _stock_name(line)
         hsn = _text(line.source.cth_hsn) or ""
-        raw_unit = _text(line.source.unit) or "NOS"
-        raw_qty = _num(line.source.quantity) or 0.0
         amount = line.land_cost_excl_gst or 0.0
-        # Convert dozens/gross/thousand to pieces; keep the amount, adjust rate.
-        qty, unit = _convert_to_pcs(raw_qty, raw_unit)
+        # Booking quantity (MTS -> KGS, tape piece count, dozens/gross/thousand
+        # -> pieces); keep the amount, adjust rate.
+        qty, unit = _booking_qty_unit(line)
         unit_rate = (amount / qty) if qty else 0.0
         pct = _pct(rate)
         half = round(pct / 2, 2)
@@ -814,10 +842,8 @@ class TallyExporter:
     def _inventory_nil(self, line: ComputedLine, cost_centre: str) -> dict:
         name = _stock_name(line)
         hsn = _text(line.source.cth_hsn) or ""
-        raw_unit = _text(line.source.unit) or "NOS"
-        raw_qty = _num(line.source.quantity) or 0.0
         amount = line.land_cost_excl_gst or 0.0
-        qty, unit = _convert_to_pcs(raw_qty, raw_unit)
+        qty, unit = _booking_qty_unit(line)
         unit_rate = (amount / qty) if qty else 0.0
         return {
             "stockitemname": name,

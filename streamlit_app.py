@@ -637,13 +637,20 @@ def _line_rows(computed, tally_map: dict, name_to_display: dict | None = None):
             value = name_to_display.get(mapped)  # None if not in this company
         else:
             value = mapped
+        # Show the quantity the Excel/Tally outputs carry: a line booked under a
+        # different quantity than the BOE prints (MTS -> KGS, a weighed tape
+        # line -> its piece count) shows that, e.g. ``White Tape`` 6500 PCS.
+        if line.stock_qty is not None:
+            qty, unit = f"{line.stock_qty:g}", line.stock_unit
+        else:
+            qty, unit = _num(src.quantity), _num(src.unit) or (src.unit.raw_text or "")
         rows.append(
             {
                 "Sr": src.item_serial,
                 "Description": _num(src.description) or (src.description.raw_text or ""),
                 "HSN": _num(src.cth_hsn) or (src.cth_hsn.raw_text or ""),
-                "Qty": _num(src.quantity),
-                "Unit": _num(src.unit) or (src.unit.raw_text or ""),
+                "Qty": qty,
+                "Unit": unit,
                 "As per Tally name": value,
             }
         )
