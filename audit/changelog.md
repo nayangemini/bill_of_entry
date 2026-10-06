@@ -4,6 +4,101 @@
 
 ---
 
+2026-10-05 19:30:03 - Merged PR #2 (MTS unit, tape pc override, invoice cartons) with review fixes
+
+### Changes
+- Merged nayangemini's PR #2 (`27c297c`): `MTS` books as `KGS` (x1000); a tape line
+  whose name carries its piece count (`PTFE TEFLON TAPE (26880 pc)`, 272 KGS) books
+  that count in PCS under the base name; the invoice carton parser accepts `CTN` as a
+  unit and header spelling, `THD`, dotted serials, split digits (`20` read as `2`+`0`),
+  fused `4000THD` tokens and lines split across two geometric rows.
+- Review found the tape override was lost in the default Tally path. It was re-derived
+  from the description in the Excel writer, the Tally exporter and the Step-2 editor,
+  and Step 2 replaces the description with the mapped Tally name:
+
+      Excel, line 8                       : 26880 PCS
+      Tally, line not mapped              : 26880.00 PCS @ 0.90
+      Tally, line mapped (default Step 3) : 272.00 KGS  @ 88.96   <- before the fix
+
+- Fixed at the root (`0136a0a`): `units.stock_quantity()` decides the booking quantity
+  once, `ValueCalculator` stores it on the `ComputedLine` (`stock_qty` / `stock_unit`)
+  and puts the tape base name in the description. The three outputs read those fields.
+  The exporter no longer parses descriptions, so a chosen Tally master name such as
+  `CELLO TAPE (12PCS)` is never rewritten or treated as a quantity.
+- Tape rule tightened: whole word `tape`/`tapes` (not `TAPERED ROLLER BEARING`), only
+  when the BOE declares the line by weight (`units.WEIGHT_UNITS`), positive count,
+  comma-grouped counts accepted. A tape line declared in DOZ/NOS keeps its BOE quantity.
+- `MTS -> KGS` is rounded to 6 decimals (`1.005 MTS` was `1004.9999999999999`); an MTS
+  line with an unreadable quantity keeps `MTS` beside it instead of a `KGS` label; the
+  Step-2 editor now shows MTS lines converted too.
+- Invoice parser guards for tolerance the PR added: a serial is captured once and only
+  rows below the column header are line items, so a numbered note (`1. PACKING: 20 PCS
+  PER CTN`) cannot overwrite line 1; the carton header is never a data row (`CTN` is
+  also a unit) nor a row below the last line item (a footer).
+- Left as the contributor tuned them on live bills not available here: the 6pt
+  digit-join threshold and the split-row stitching rule.
+- Tests: 92 added (the PR shipped none). Full suite 439 passed, 9 skipped (was 347 / 9).
+  On the five real BOEs and two real invoices the output differs from the previous
+  `main` only on the weighed tape line; both invoices parse identically.
+
+### Files
+- `boe_converter/units.py` — modified (`UNIT_TO_KGS`, `WEIGHT_UNITS`, `tape_pcs_override`, `stock_quantity`)
+- `boe_converter/models.py` — modified (`ComputedLine.stock_qty` / `stock_unit`)
+- `boe_converter/calculator.py` — modified (booking quantity, base name, per-unit rate)
+- `boe_converter/excel_writer.py` — modified (H/I/K/Y read the line's booking quantity)
+- `boe_converter/tally_exporter.py` — modified (`_booking_qty_unit`, MTS fallback)
+- `boe_converter/invoice_parser.py` — modified (PR's parser changes, `_ctns_header`, guards)
+- `streamlit_app.py` — modified (Step-2 editor quantity/unit)
+- `tests/test_units.py` — modified
+- `tests/test_stock_quantity.py` — created
+- `tests/test_invoice_row_parsing.py` — created
+
+---
+
+2026-08-26 11:06:02 - BUG-002/003/004 reopened: carry buyer/seller identity through the Excel round-trip
+
+### Changes
+- The earlier fix removed the hardcoded `"India"` supplier-country fallback but left
+  the field **blank**, which is not a fix: Tally substitutes its own company defaults
+  for a blank field on import, so the bill still showed India for a Chinese supplier
+  and an empty place of supply. The tester was right that nothing had changed.
+- Root cause is one level up. The CTN workbook is a costing table with no GSTIN,
+  state or country cells, so `PDF -> Excel -> re-upload` discarded the buyer and
+  seller identity outright and the exporter had nothing left to emit:
+
+      BEFORE write: gstin=27AAYFG7003K1ZW state=Maharashtra country=China
+      AFTER  read : gstin=None            state=None       country=None
+
+- The workbook now carries that identity as OOXML custom document properties
+  (`write_identity_props` / `read_identity_props`): invisible in the grid, outside
+  every golden-tested cell, unaffected by the one-sheet rule (Req 8.1), and
+  preserved across the load-and-resave the Step 2 name mapping performs. Chosen
+  over visible cells (the layout is reproduced character-for-character from the
+  sample and golden-tested) and over a hidden sheet (`test_e2e_integration.py`
+  asserts `wb.sheetnames == ["Sheet1"]`).
+- Because a blank field fails *silently* in Tally, the app now warns at export time
+  naming each field Tally would substitute a default for.
+
+### Verification
+With no stored buyer/seller configured, the reported path yields
+`countryofresidence=China`, `placeofsupply=Maharashtra`,
+`consigneestatename=Maharashtra`, `cmpgstin=27AAYFG7003K1ZW`.
+Pre-change workbooks still read (identity stays missing, never invented).
+Full suite: 347 passed, 9 skipped.
+
+### Known follow-up
+The GSTIN state-code table now exists twice: `parser._GSTIN_STATE` and
+`tally_exporter._GSTIN_STATE_CODES`. Worth consolidating into a shared module
+alongside `boe_converter/units.py`.
+
+### Files
+- `boe_converter/excel_writer.py` - modified
+- `boe_converter/excel_reader.py` - modified
+- `streamlit_app.py` - modified
+- `tests/test_excel_identity_roundtrip.py` - created
+
+---
+
 2026-08-23 08:28:58 - Complete the BOE -> Tally purchase pipeline: cost centre, party allocation, no nameless allocations
 
 ### Changes

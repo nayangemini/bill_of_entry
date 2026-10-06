@@ -146,6 +146,14 @@ class ComputedLine:
 
     Any value depending on a missing/non-numeric input is left ``None`` (written
     blank) and the line is flagged for review (Req 6.13).
+
+    ``stock_qty``/``stock_unit`` are set only for a line booked under a different
+    quantity than the BOE prints (MTS -> KGS; a weighed tape line -> its bracketed
+    piece count in PCS). They ride on the line so the workbook, the Tally voucher
+    and the Step-2 editor read one answer instead of each re-deriving it from the
+    description - which Step 2 replaces with the mapped Tally name. ``source``
+    keeps the BOE quantity and unit; for such a tape line its description is the
+    base name (``White Tape``, not ``White Tape (6500pc)``).
     """
 
     source: LineItem
@@ -161,6 +169,8 @@ class ComputedLine:
     pcs: float | None = None                     # Req 5.8  = qty*pcs_factor(unit) (DOZ/GRS/THD)
     pcs_factor: float | None = None              # Req 14.x pieces-per-unit factor used for pcs / Excel formula
     purchase_rate_per_unit: float | None = None  # Req 6.9  = land_cost_excl_gst / qty ; 0 when qty==0
+    stock_qty: float | None = None               # booking qty when it differs from the BOE's, else None
+    stock_unit: str | None = None                # unit of stock_qty ("KGS" / "PCS")
 
 
 @dataclass(frozen=True)

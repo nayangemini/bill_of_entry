@@ -27,7 +27,7 @@ from boe_converter.models import RawValue
 # to bound the carton column on its right.
 _UNIT_RE = re.compile(r"^[A-Za-z]{2,4}$")
 _UNITS = {
-    "PCS", "PC", "DOZ", "KGS", "KG", "GRS", "SET", "NOS", "EA", "UNT",
+    "PCS", "PC", "DOZ", "KGS", "KG", "GRS", "THD", "SET", "NOS", "EA", "UNT",
     "MTR", "PRS", "BOX", "MTS", "MT", "CTN", "PKT", "BAG", "ROL", "YDS",
     "LTR", "SQM", "PAIR",
 }
@@ -51,6 +51,16 @@ _HEADER_HINTS = {"SR", "NO", "DESCRIPTION", "QTY", "PRICE", "AMOUNT", "UNIT", "U
 # tokens keeps two genuinely separate numbers from merging.
 _DIGIT_JOIN_GAP = 6.0
 
+# Max vertical gap (points) for stitching a serial-bearing row fragment to an
+# adjacent unit-bearing fragment of the same logical invoice line. Covers
+# baseline drift that splits one line across two geometric rows; normal row
+# pitch (~15pt+) stays well outside it.
+_ROW_STITCH_GAP = 8.0
+
+# Words marking a totals/footer row: never absorb such a row while stitching,
+# so a footer ("TOTAL CTN : 1159") cannot donate its number to a serial above.
+_NON_DATA_HINTS = {"TOTAL", "SUBTOTAL", "GRAND", "BALANCE"}
+
 
 def _header_token(text: str) -> str | None:
     """The carton-header token in ``text``, else ``None``."""
@@ -65,6 +75,111 @@ def _serial_text(text: str) -> int | None:
     """A serial number from a far-left token (tolerating ``1.``), else ``None``."""
     cleaned = text.strip().rstrip(".").strip()
     return int(cleaned) if cleaned.isdigit() else None
+
+
+def _xcenter(w: dict) -> float:
+    """Horizontal centre of an extractor word."""
+    return (float(w["x0"]) + float(w["x1"])) / 2.0
+
+
+def _is_unit_token(text: str) -> bool:
+    """True when ``text`` is a known unit (tolerating trailing punctuation)."""
+    cleaned = text.strip().upper().strip(".,:;")
+    return bool(_UNIT_RE.match(cleaned)) and cleaned in _UNITS
+
+
+def _fused_unit(text: str) -> str | None:
+    """The unit part of a fused ``number+unit`` token (``4000THD``), else ``None``."""
+    core = text.strip().rstrip(".,:;")
+    m = re.fullmatch(r"\d+(?:\.\d+)?([A-Za-z]{2,4})", core)
+    if m and m.group(1).upper() in _UNITS:
+        return m.group(1).upper()
+    return None
+
+
+def _split_merged_token(w: dict) -> list[dict]:
+    """Split a fused ``number+unit`` token for matching (geometry shared).
+
+    Only the returned pieces drive the serial/unit/carton checks; captured
+    description text always uses the original word, so names like
+    ``126PCS STATIONERY SET`` stay verbatim.
+    """
+    unit = _fused_unit(w["text"])
+    if unit is None:
+        return [w]
+    core = w["text"].strip().rstrip(".,:;")
+    num = core[: len(core) - len(unit)]
+    width = float(w["x1"]) - float(w["x0"])
+    cut = float(w["x0"]) + width * len(num) / (len(num) + len(unit))
+    return [
+        {**w, "text": num, "x1": cut},
+        {**w, "text": unit, "x0": cut},
+    ]
+
+
+def _row_top(row: list[dict]) -> float:
+    """Top edge of a row group (its highest word)."""
+    return min(float(w["top"]) for w in row)
+
+
+def _row_has_sr(row: list[dict]) -> bool:
+    """True when the row carries a far-left serial number."""
+    return any(
+        _xcenter(w) < _SR_NO_MAX_X and _serial_text(w["text"]) is not None
+        for w in row
+    )
+
+
+def _row_has_unit(row: list[dict]) -> bool:
+    """True when the row carries any known unit token (fused ones count)."""
+    return any(
+        _is_unit_token(w["text"]) or _fused_unit(w["text"]) is not None
+        for w in row
+    )
+
+
+def _row_has_totals_word(row: list[dict]) -> bool:
+    """True when the row looks like a totals/footer row."""
+    return any(
+        w["text"].strip().upper().strip(".,:;") in _NON_DATA_HINTS for w in row
+    )
+
+
+def _stitch_split_rows(rows: list[list[dict]]) -> list[list[dict]]:
+    """Rejoin logical invoice lines split across two geometric rows.
+
+    When a row carries a serial but no unit (baseline drift pushed its numeric
+    half out of the group), it absorbs the adjacent unit-bearing, serial-free
+    group within ``_ROW_STITCH_GAP``. Groups with both halves intact, and
+    totals/footer rows, pass through untouched.
+    """
+    stitched: list[list[dict]] = []
+    consumed: set[int] = set()
+    for i, row in enumerate(rows):
+        if i in consumed:
+            continue
+        if _row_has_sr(row) and not _row_has_unit(row):
+            partner = None
+            for j in (i + 1, i - 1):
+                if not 0 <= j < len(rows) or j in consumed:
+                    continue
+                other = rows[j]
+                if _row_has_sr(other) or not _row_has_unit(other):
+                    continue
+                if _row_has_totals_word(other):
+                    continue
+                if abs(_row_top(other) - _row_top(row)) > _ROW_STITCH_GAP:
+                    continue
+                partner = j
+                break
+            if partner is not None:
+                if partner == i - 1:
+                    row = stitched.pop() + row
+                else:
+                    row = row + rows[partner]
+                consumed.add(partner)
+        stitched.append(row)
+    return stitched
 
 
 class InvoicePackingListParser:
@@ -160,46 +275,65 @@ class InvoicePackingListParser:
 
     @staticmethod
     def _center(w: dict) -> float:
-        return (float(w["x0"]) + float(w["x1"])) / 2.0
+        return _xcenter(w)
 
-    def _ctns_center(self, rows: list[list[dict]]) -> float | None:
-        """Locate the carton column header's horizontal centre on the page.
+    def _ctns_header(self, rows: list[list[dict]]) -> tuple[int, float] | None:
+        """Locate the carton column header: ``(row index, horizontal centre)``.
 
         Accepts ``CTN``/``CTNS`` in any case with trailing punctuation (suppliers
         vary the label). When several candidates exist, the one sharing its row
         with table-header words (SR/NO/DESCRIPTION/QTY/...) wins, so a stray
         "TOTAL CTNS: 500" in title text cannot hijack the band; otherwise the
         first candidate is used.
+
+        A header has line items beneath it, so only rows above the page's last
+        line item are candidates - a footer ("TOTAL CTNS: 1159 TOTAL QTY 4500")
+        cannot displace a header printed on a row of its own. A row carrying a
+        serial is a line item, never the header: ``CTN`` is also a unit, so a
+        data row would otherwise qualify.
         """
-        fallback: float | None = None
-        for row in rows:
+        last_item = max(
+            (i for i, row in enumerate(rows) if _row_has_sr(row) and _row_has_unit(row)),
+            default=0,
+        )
+        hinted: list[tuple[int, float]] = []
+        plain: list[tuple[int, float]] = []
+        for index, row in enumerate(rows[:last_item]):
+            if _row_has_sr(row):
+                continue
             hits = [w for w in row if _header_token(w["text"])]
             if not hits:
                 continue
-            if fallback is None:
-                fallback = self._center(hits[0])
             row_words = {
                 w["text"].strip().upper().strip(".,:;") for w in row
             }
-            if row_words & _HEADER_HINTS:
-                return self._center(hits[0])
-        return fallback
+            found = (index, self._center(hits[0]))
+            (hinted if row_words & _HEADER_HINTS else plain).append(found)
+        candidates = hinted + plain
+        return candidates[0] if candidates else None
 
     def _parse_page(self, page, details: dict[int, dict]) -> None:
         rows = self._rows(page)
-        ctns_center = self._ctns_center(rows)
-        if ctns_center is None:
+        rows = _stitch_split_rows(rows)
+        header = self._ctns_header(rows)
+        if header is None:
             return
+        header_index, ctns_center = header
         lo, hi = ctns_center - _CTNS_BAND, ctns_center + _CTNS_BAND
         # The description column sits between the SR NO column and the CTNS band.
         desc_hi = ctns_center - _CTNS_BAND
 
-        for row in rows:
+        # The table sits below its column header; anything above it (letterhead,
+        # addresses) is not a line item even when it starts with a number.
+        for row in rows[header_index + 1:]:
             ordered = sorted(row, key=lambda w: float(w["x0"]))
+            # Matching sees through fused number+unit tokens (4000THD); the
+            # captured description below always uses the original words.
+            gate = [s for w in ordered for s in _split_merged_token(w)]
             # SR NO: an integer in the far-left column (tolerating a trailing
             # dot, e.g. "1." as some invoices print it).
             sr_word = next(
-                (w for w in ordered
+                (w for w in gate
                  if self._center(w) < _SR_NO_MAX_X and _serial_text(w["text"]) is not None),
                 None,
             )
@@ -207,17 +341,17 @@ class InvoicePackingListParser:
                 continue
             # Require a unit token (e.g. PCS/DOZ) so totals/footer rows are
             # ignored - they have a serial-like number but no unit.
-            has_unit = any(
-                _UNIT_RE.match(w["text"].strip())
-                and w["text"].strip().upper() in _UNITS
-                for w in ordered
-            )
-            if not has_unit:
+            if not any(_is_unit_token(w["text"]) or _fused_unit(w["text"]) for w in gate):
                 continue
 
             serial = _serial_text(sr_word["text"])
             assert serial is not None
-            entry = details.setdefault(serial, {"cartons": None, "description": None})
+            # A serial is captured once. A numbered note below the table
+            # ("1. PACKING: 20 PCS PER CTN") reads as serial 1 with a unit; it
+            # must not replace the real line 1, on this page or an earlier one.
+            if serial in details:
+                continue
+            entry = details[serial] = {"cartons": None, "description": None}
 
             # Carton count: numeric token(s) whose centre falls in the CTNS
             # band. Adjacent digit tokens are joined first: extractors can
@@ -225,7 +359,7 @@ class InvoicePackingListParser:
             # 20 into 2. Only near-adjacent tokens merge, so genuinely
             # separate numbers never combine.
             ctn_words = [
-                w for w in ordered
+                w for w in gate
                 if lo <= self._center(w) <= hi
                 and self._is_number(w["text"])
             ]
@@ -235,7 +369,9 @@ class InvoicePackingListParser:
                 )
 
             # Description: all tokens between the SR NO column and the CTNS band,
-            # left-to-right (e.g. "SLIDERS (GARMENT ACCESSORY)").
+            # left-to-right (e.g. "SLIDERS (GARMENT ACCESSORY)"). Original
+            # words are used so fused names ("126PCS STATIONERY SET") stay
+            # verbatim.
             desc_words = [
                 w for w in ordered
                 if _SR_NO_MAX_X <= self._center(w) < desc_hi
@@ -257,7 +393,7 @@ class InvoicePackingListParser:
         ``_DIGIT_JOIN_GAP``. The first group wins: a row carries a single
         carton value, so extra far-apart groups are stray marks, not data.
         """
-        ranked = sorted(words, key=lambda w: (float(w["x0"]) + float(w["x1"])) / 2.0)
+        ranked = sorted(words, key=_xcenter)
         groups: list[list[dict]] = [[ranked[0]]]
         for w in ranked[1:]:
             prev = groups[-1][-1]
