@@ -4,17 +4,22 @@ The parser is positional, so each test lays out a page as extractor words
 (``text``, ``x0``, ``x1``, ``top``) around the layout the real supplier invoices
 use: SR NO | DESCRIPTION | TOTAL CTNS | QTY | UNIT | UNIT PRICE | AMOUNT.
 
-Two groups:
+Three groups:
 
 - the behaviours PR #2 added (``CTN`` as a unit and as a header spelling, split
   digits, ``THD``, dotted serials, fused ``number+unit`` tokens, split-row
   stitching), pinned here because they shipped without tests;
+- the behaviour PR #3 added: a unit that arrives punctuated (``THD.``) or merged
+  with its right-hand neighbour (``THD$0.12``) still marks a line item;
 - the guards that keep that added tolerance from misreading a page: numbered
   notes are not line items, and the carton header is never a data row.
 """
 
 from __future__ import annotations
 
+import pytest
+
+from boe_converter import invoice_parser
 from boe_converter.invoice_parser import InvoicePackingListParser
 
 
@@ -152,6 +157,64 @@ def test_footer_total_is_never_stitched_onto_a_line():
         W("TOTAL", 100, 130, 126), W("CTN", 300, 318, 126), ctn("1159", 126),
     ]
     assert parse(page) == {}
+
+
+# ---------------------------------------------------------------------------
+# Behaviour added by PR #3: punctuated and merged unit tokens
+# ---------------------------------------------------------------------------
+def _row_with_unit_token(unit_token, top=120):
+    """Serial 8, ``METAL CLIP``, 40 cartons, 4000 of ``unit_token``."""
+    return [
+        W("8", 30, 38, top), W("METAL", 100, 130, top), W("CLIP", 134, 158, top),
+        ctn("40", top), W("4000", 395, 420, top), W(unit_token, 440, 480, top),
+        W("480", 540, 565, top),
+    ]
+
+
+@pytest.mark.parametrize("token", ["THD.", "THD,", "CTN:", "thd."])
+def test_punctuated_unit_token(token):
+    assert parse(header() + _row_with_unit_token(token)) == {8: (40, "METAL CLIP")}
+
+
+@pytest.mark.parametrize("token", ["THD$0.12", "PCS$1.5", "THD0.12", "KGS/"])
+def test_unit_merged_with_its_neighbour(token):
+    """A tight layout prints ``4000 THD $0.12`` with no gap the extractor can
+    see, so the unit arrives fused to the price. The row is still a line item:
+    it must pass the row gate and count as one when the header is located."""
+    assert parse(header() + _row_with_unit_token(token)) == {8: (40, "METAL CLIP")}
+
+
+@pytest.mark.parametrize("token", ["BOXES.", "THDX$1", "12CM", "CM.", "$0.12"])
+def test_token_that_only_resembles_a_unit_does_not_qualify_a_row(token):
+    assert parse(header() + _row_with_unit_token(token)) == {}
+
+
+def test_row_with_a_merged_unit_is_complete_and_absorbs_nothing():
+    """If a merged unit went unrecognised the row would look like a fragment
+    missing its numeric half and stitch the wrapped name line below onto itself."""
+    wrapped = [W("GIFT", 100, 124, 126), W("SET", 128, 146, 126)]
+    page = header() + _row_with_unit_token("THD$0.12") + wrapped
+    assert parse(page) == {8: (40, "METAL CLIP")}
+
+
+@pytest.mark.parametrize(
+    "text,unit",
+    [
+        ("THD", "THD"), ("thd", "THD"), (" THD. ", "THD"), ("CTN:", "CTN"),
+        ("THD$0.12", "THD"), ("PAIR$2", "PAIR"),
+    ],
+)
+def test_unit_token_recognises(text, unit):
+    assert invoice_parser._unit_token(text) == unit
+
+
+@pytest.mark.parametrize(
+    "text", ["2PCS", "126PCS", "12CM", "BOXES.", "TOTAL", "DESCRIPTION", "$0.12", ""]
+)
+def test_unit_token_rejects(text):
+    """Digit-led fragments are not this function's business (a fused
+    ``4000THD`` is handled separately); longer words are not units."""
+    assert invoice_parser._unit_token(text) is None
 
 
 # ---------------------------------------------------------------------------
