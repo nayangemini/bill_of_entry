@@ -22,14 +22,7 @@
 - [ ] Repeat the ground-truth diff once data for a second company arrives
 
 ## Done (this session)
-- [x] Reviewed PR #2 (MTS unit, tape pc override, invoice cartons): 15 findings
-- [x] Fixed the tape override being lost once a line is mapped in Step 2 (booking
-      quantity decided once in the calculator, carried on the line)
-- [x] Tape rule: whole word, weight unit only, comma counts; Tally master names never
-      rewritten
-- [x] MTS -> KGS rounding; Step-2 editor shows MTS lines converted
-- [x] Invoice parser: numbered notes cannot overwrite a line; header never a data row
-      or footer
-- [x] 92 tests added; full suite green: 439 passed, 9 skipped
-- [x] Real bills: output differs from the previous `main` only on the weighed tape line
-- [x] PR #2 merged (`27c297c`); local `main` pulled
+- [x] Merged PR #3 (`5562247`): unit merged with its neighbour (`THD$0.12`) now marks
+      an invoice line item; conflict with PR #2's parser resolved by hand
+- [x] 28 tests added; full suite green: 467 passed, 9 skipped
+- [x] Both real invoices parse identically to before

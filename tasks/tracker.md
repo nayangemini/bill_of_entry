@@ -2,6 +2,19 @@
 <!-- Append-only. Newest at TOP. -->
 <!-- Format: ## YYYY-MM-DD HH:MM:SS — <summary> -->
 
+## 2026-10-06 14:37:23 — Merged PR #3 (punctuated / merged unit tokens in invoice rows)
+**Type:** task-complete
+**Outcome:** nayangemini's one-commit PR #3 is in `main`. It conflicted with the parser
+as changed by PR #2, so the merge was resolved by hand: its `_unit_token()` now backs
+the shared unit test used by the row gate, row stitching and header detection. Only
+the merged-unit form (`THD$0.12`) was new; `THD` and punctuated units were already on
+`main`. 28 tests added; full suite 467 passed, 9 skipped; both real invoices parse
+identically to before.
+**Open:** the fork-side PRs (#2 and #3 on `nayangemini/bill_of_entry`) cannot be merged
+from here (read-only); the fork's `main` still lacks PR #2's second commit and the
+review fixes.
+**Files changed:** boe_converter/invoice_parser.py, tests/test_invoice_row_parsing.py
+
 ## 2026-10-05 19:30:03 — Reviewed, fixed and merged PR #2 (MTS unit, tape pc override, invoice cartons)
 **Type:** task-complete
 **Outcome:** PR #2 from nayangemini is merged into `main` (`27c297c`). Review confirmed

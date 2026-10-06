@@ -4,6 +4,31 @@
 
 ---
 
+2026-10-06 14:37:23 - Merged PR #3: invoice rows tolerate punctuated and merged unit tokens
+
+### Changes
+- Merged nayangemini's `5562247` (raised as `rushabhgandhi13/boe-converter#3` and
+  `nayangemini/bill_of_entry#3`). It was written against the fork's `main`, which lacks
+  PR #2's second commit and the review fixes, so `invoice_parser.py` conflicted and was
+  resolved by hand.
+- Of its three changes, two were already on `main` (`THD` in the unit allowlist;
+  punctuated units such as `THD.` / `CTN:`). The new behaviour is a unit merged with its
+  right-hand neighbour by a tight layout (`THD$0.12`): such a row was dropped before.
+- The PR's `_unit_token()` replaces `_is_unit_token()` and is wired into the shared
+  `_row_has_unit()`, not only the row gate the PR touched. Split-row stitching and header
+  detection use the same test; otherwise a complete row with a merged unit looked like a
+  unit-less fragment and absorbed the wrapped line below it (`METAL GIFT SET CLIP`).
+- Kept from PR #2: a fused `4000THD` still counts. PR #3's note that digit-led fragments
+  never qualify a row is true of `_unit_token()` only.
+- Tests: 28 added (the PR had none). Full suite 467 passed, 9 skipped (was 439 / 9).
+  Both real invoices parse identically to before.
+
+### Files
+- `boe_converter/invoice_parser.py` — modified (`_unit_token`, `_row_has_unit`, row gate)
+- `tests/test_invoice_row_parsing.py` — modified
+
+---
+
 2026-10-05 19:30:03 - Merged PR #2 (MTS unit, tape pc override, invoice cartons) with review fixes
 
 ### Changes
