@@ -27,9 +27,9 @@ from boe_converter.models import RawValue
 # to bound the carton column on its right.
 _UNIT_RE = re.compile(r"^[A-Za-z]{2,4}$")
 _UNITS = {
-    "PCS", "PC", "DOZ", "KGS", "KG", "GRS", "SET", "NOS", "EA", "UNT",
-    "MTR", "PRS", "BOX", "MTS", "MT", "CTN", "PKT", "BAG", "ROL", "YDS",
-    "LTR", "SQM", "PAIR",
+    "PCS", "PC", "DOZ", "KGS", "KG", "GRS", "THD", "SET", "NOS", "EA",
+    "UNT", "MTR", "PRS", "BOX", "MTS", "MT", "CTN", "PKT", "BAG", "ROL",
+    "YDS", "LTR", "SQM", "PAIR",
 }
 
 # Horizontal half-width (points) of the carton column band around the ``CTNS``
@@ -65,6 +65,23 @@ def _serial_text(text: str) -> int | None:
     """A serial number from a far-left token (tolerating ``1.``), else ``None``."""
     cleaned = text.strip().rstrip(".").strip()
     return int(cleaned) if cleaned.isdigit() else None
+
+
+def _unit_token(text: str) -> str | None:
+    """A known unit hiding in ``text``, else ``None``.
+
+    Accepts the bare token (``THD``) plus punctuated/merged extractions the PDF
+    reader produces (``THD.``, ``CTN:``, ``THD$0.12``): a leading 2-4 letter run
+    in the unit table counts. Tokens starting with a digit (``2PCS``,
+    ``12CM``) never count, so description fragments can't qualify a row.
+    """
+    cleaned = text.strip()
+    if _UNIT_RE.match(cleaned) and cleaned.upper() in _UNITS:
+        return cleaned.upper()
+    m = re.match(r"^([A-Za-z]{2,4})[^A-Za-z\s]", cleaned)
+    if m and m.group(1).upper() in _UNITS:
+        return m.group(1).upper()
+    return None
 
 
 class InvoicePackingListParser:
@@ -206,11 +223,11 @@ class InvoicePackingListParser:
             if sr_word is None:
                 continue
             # Require a unit token (e.g. PCS/DOZ) so totals/footer rows are
-            # ignored - they have a serial-like number but no unit.
+            # ignored - they have a serial-like number but no unit. The match
+            # is punctuation-tolerant (``THD.``, ``CTN:``, ``THD$0.12``) since
+            # tight supplier layouts merge the unit with its neighbour.
             has_unit = any(
-                _UNIT_RE.match(w["text"].strip())
-                and w["text"].strip().upper() in _UNITS
-                for w in ordered
+                _unit_token(w["text"]) is not None for w in ordered
             )
             if not has_unit:
                 continue
