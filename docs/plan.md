@@ -2,6 +2,53 @@
 
 ---
 
+2026-10-06 14:25:07 - Bring PR #3 (THD unit, punctuated/merged unit tokens) into main
+
+### Context
+nayangemini raised the same one-commit change twice: `nayangemini/bill_of_entry#3`
+(against the fork's `main`, for their production deploy) and
+`rushabhgandhi13/boe-converter#3` (against ours). The user asked for the changes to be
+added to `main`. The commit (`5562247`) was written against the fork's `main`, which
+does not have PR #2's second commit or the review fixes, so it conflicts with our
+`invoice_parser.py` (GitHub reports the upstream PR as CONFLICTING).
+
+What it contains, against what `main` already has:
+
+| PR #3 change | On `main` already? |
+|---|---|
+| `THD` in the invoice unit allowlist | Yes (PR #2, `14b3f7b`) |
+| Punctuated unit tokens (`THD.`, `CTN:`) | Yes (trailing `.,:;` stripped) |
+| Unit merged with its right-hand neighbour (`THD$0.12`) | **No - the new behaviour** |
+
+### Approach
+- Merge the commit (keeps the contributor's authorship and lets GitHub close the
+  upstream PR) and resolve the conflict by hand: keep `main`'s parser and adopt the
+  PR's `_unit_token()` as the one definition of "this token carries a unit".
+- Wire it into the shared predicate, not only the row gate the PR touched. `main` also
+  uses unit detection to stitch split rows and to find the last line item; if those
+  did not recognise `THD$0.12`, a complete row with a merged unit would look like a
+  unit-less fragment and could absorb a neighbouring line.
+- Tests first for the merged-unit behaviour (the PR has none; its author could not run
+  `pytest`).
+
+### Tradeoffs
+- PR #3's description says digit-led fragments (`2PCS`, `126PCS`) never qualify a row.
+  That holds for `_unit_token()` but not for `main` as a whole: PR #2, from the same
+  author, deliberately accepts a fused `4000THD`. Left as it is; removing it would undo
+  that fix.
+- The leading-run rule also matches a unit followed by a digit or hyphen inside a name
+  (`PC-200`, `MT-07`), so the row gate is slightly more permissive. The guards added
+  with PR #2 (serial captured once, rows below the header only) bound the effect.
+- Cannot merge the fork-side PR (#3 on `nayangemini/bill_of_entry`): read-only access.
+
+### Checklist
+- [x] Failing tests for merged unit tokens
+- [x] Merge `5562247`, resolve `invoice_parser.py`
+- [x] Full suite; real invoices parse identically to before
+- [x] Push `main`; confirm upstream PR #3 shows as merged
+
+---
+
 2026-10-05 14:50:00 - Fix the review findings on PR #2 (MTS unit, tape pc override, invoice cartons) before merging it
 
 ### Context

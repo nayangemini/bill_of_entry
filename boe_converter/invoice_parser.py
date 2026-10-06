@@ -82,10 +82,23 @@ def _xcenter(w: dict) -> float:
     return (float(w["x0"]) + float(w["x1"])) / 2.0
 
 
-def _is_unit_token(text: str) -> bool:
-    """True when ``text`` is a known unit (tolerating trailing punctuation)."""
-    cleaned = text.strip().upper().strip(".,:;")
-    return bool(_UNIT_RE.match(cleaned)) and cleaned in _UNITS
+def _unit_token(text: str) -> str | None:
+    """A known unit carried by ``text``, else ``None``.
+
+    Accepts the bare token (``THD``) plus punctuated/merged extractions the PDF
+    reader produces (``THD.``, ``CTN:``, ``THD$0.12``): a leading 2-4 letter run
+    in the unit table counts, since tight supplier layouts merge the unit with
+    its right-hand neighbour. A token starting with a digit (``2PCS``,
+    ``12CM``) is never matched here; a fused ``number+unit`` (``4000THD``) is
+    :func:`_fused_unit`'s job.
+    """
+    cleaned = text.strip().strip(".,:;")
+    if _UNIT_RE.match(cleaned) and cleaned.upper() in _UNITS:
+        return cleaned.upper()
+    m = re.match(r"^([A-Za-z]{2,4})[^A-Za-z\s]", cleaned)
+    if m and m.group(1).upper() in _UNITS:
+        return m.group(1).upper()
+    return None
 
 
 def _fused_unit(text: str) -> str | None:
@@ -133,7 +146,7 @@ def _row_has_sr(row: list[dict]) -> bool:
 def _row_has_unit(row: list[dict]) -> bool:
     """True when the row carries any known unit token (fused ones count)."""
     return any(
-        _is_unit_token(w["text"]) or _fused_unit(w["text"]) is not None
+        _unit_token(w["text"]) is not None or _fused_unit(w["text"]) is not None
         for w in row
     )
 
@@ -340,8 +353,10 @@ class InvoicePackingListParser:
             if sr_word is None:
                 continue
             # Require a unit token (e.g. PCS/DOZ) so totals/footer rows are
-            # ignored - they have a serial-like number but no unit.
-            if not any(_is_unit_token(w["text"]) or _fused_unit(w["text"]) for w in gate):
+            # ignored - they have a serial-like number but no unit. The match
+            # is punctuation-tolerant (``THD.``, ``CTN:``, ``THD$0.12``) since
+            # tight supplier layouts merge the unit with its neighbour.
+            if not _row_has_unit(gate):
                 continue
 
             serial = _serial_text(sr_word["text"])
