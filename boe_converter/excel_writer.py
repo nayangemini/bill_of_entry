@@ -455,6 +455,18 @@ class ExcelGenerator:
             # position; the template totals row slides up into place.
             ws.delete_rows(totals_row, -shift)
 
+        # openpyxl moves cells without their row dimensions. Move the footer
+        # and auxiliary row heights with the cells and drop deleted dimensions.
+        moved_dimensions = {}
+        for row in list(ws.row_dimensions):
+            if row < min(totals_row, _TEMPLATE_TOTALS_ROW):
+                continue
+            dimension = ws.row_dimensions.pop(row)
+            if row >= _TEMPLATE_TOTALS_ROW:
+                dimension.index = row + shift
+                moved_dimensions[dimension.index] = dimension
+        ws.row_dimensions.update(moved_dimensions)
+
         # Re-create the captured merges at their shifted positions.
         for min_row, min_col, max_row, max_col in below_specs:
             ws.merge_cells(
@@ -469,6 +481,8 @@ class ExcelGenerator:
             self._clone_data_row_style(
                 ws, _TEMPLATE_TOTALS_ROW, _TEMPLATE_TOTALS_ROW + shift - 1
             )
+            for row in range(_TEMPLATE_TOTALS_ROW, totals_row):
+                ws.row_dimensions[row].height = ws.row_dimensions[_TEMPLATE_STYLE_ROW].height
 
     # Backwards-compatible alias (overflow-only callers/tests).
     def _expand_for_overflow(self, ws: Worksheet, shift: int) -> None:
@@ -648,26 +662,27 @@ class ExcelGenerator:
         # its count once and spans the same line rows in column G. The totals
         # SUM then counts the group once (924/916-style totals stay right)
         # instead of multiplying the count by the number of shared lines.
-        last_item_row = ITEM_TABLE_FIRST_DATA_ROW + len(ordered) - 1
         for offset, line in enumerate(ordered):
-            span = line.source.cartons_span
-            if span <= 1 or _raw_number(line.source.cartons) is None:
+            serials = line.source.carton_group
+            if len(serials) <= 1 or _raw_number(line.source.cartons) is None:
+                continue
+            group = ordered[offset : offset + len(serials)]
+            if tuple(ln.source.item_serial for ln in group) != serials:
+                continue
+            # Never let a merge discard another count (or make the literal
+            # total disagree with Excel's SUM) if the input lines conflict.
+            if any(not ln.source.cartons.is_missing for ln in group[1:]):
                 continue
             first_row = ITEM_TABLE_FIRST_DATA_ROW + offset
-            last_row = min(first_row + span - 1, last_item_row)
-            if last_row > first_row:
-                ws.merge_cells(
-                    start_row=first_row,
-                    start_column=COL_CTN,
-                    end_row=last_row,
-                    end_column=COL_CTN,
-                )
-                # A merged cell only shows the top-left style. If any line in
-                # the shared group differs from the invoice, red-fill the whole
-                # merged CTN cell so the alert is not hidden by the merge.
-                group = ordered[offset : offset + (last_row - first_row + 1)]
-                if any(ln.source.invoice_mismatch for ln in group):
-                    ws.cell(row=first_row, column=COL_CTN).fill = INVOICE_MISMATCH_FILL
+            ws.merge_cells(
+                start_row=first_row,
+                start_column=COL_CTN,
+                end_row=first_row + len(group) - 1,
+                end_column=COL_CTN,
+            )
+            # A merged cell displays only the top-left style.
+            if any(ln.source.invoice_mismatch for ln in group):
+                ws.cell(row=first_row, column=COL_CTN).fill = INVOICE_MISMATCH_FILL
 
     def _write_item_row(
         self,
@@ -775,7 +790,7 @@ class ExcelGenerator:
         sws_matches_rate = (
             line.cust_aidc is not None
             and line.sws_amount is not None
-            and abs(line.cust_aidc * sws_rate_for_formula - line.sws_amount) <= 0.01
+            and line.cust_aidc * sws_rate_for_formula == line.sws_amount
         )
         if sws_matches_rate:
             self._put_computed(

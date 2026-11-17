@@ -162,6 +162,16 @@ def test_declared_sws_below_rate_times_base_writes_the_printed_amount():
     assert abs(computed.lines[0].igst_amount - expected_igst) < 1e-9
 
 
+def test_excel_keeps_printed_sws_when_rate_differs_by_less_than_a_cent():
+    item = replace(
+        _item(1), bcd_amount=_num(100.06), sws_rate=_num(0.1),
+        sws_amount=RawValue(raw_text="10.00", parsed=10),
+    )
+    ws, computed = _build([item])
+    assert computed.lines[0].sws_amount == 10
+    assert ws["W13"].value == 10
+
+
 def test_rate_cells_format_whole_and_fractional_percentages():
     """R/T keep exact values while avoiding rounded or dangling-percent display."""
     ws, _ = _build([_item(1, bcd_rate=0.075, igst_rate=0.18)])

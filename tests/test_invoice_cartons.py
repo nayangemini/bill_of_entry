@@ -87,19 +87,19 @@ def test_lineitem_cartons_defaults_to_missing():
 # ---------------------------------------------------------------------------
 class _StubInvoiceParser:
     def __init__(self, cartons=None, descriptions=None, unit_prices=None,
-                 quantities=None, amounts=None, cartons_spans=None):
+                 quantities=None, amounts=None, carton_groups=None):
         self._cartons = dict(cartons or {})
         self._descriptions = dict(descriptions or {})
         self._unit_prices = dict(unit_prices or {})
         self._quantities = dict(quantities or {})
         self._amounts = dict(amounts or {})
-        self._cartons_spans = dict(cartons_spans or {})
+        self._carton_groups = dict(carton_groups or {})
 
     def parse_line_details(self, doc):  # noqa: ANN001
         serials = (
             set(self._cartons) | set(self._descriptions) | set(self._unit_prices)
             | set(self._quantities) | set(self._amounts)
-            | set(self._cartons_spans)
+            | set(self._carton_groups)
         )
         return {
             s: {
@@ -108,7 +108,7 @@ class _StubInvoiceParser:
                 "unit_price": self._unit_prices.get(s),
                 "quantity": self._quantities.get(s),
                 "amount": self._amounts.get(s),
-                "cartons_span": self._cartons_spans.get(s),
+                "carton_group": self._carton_groups.get(s),
             }
             for s in serials
         }
@@ -130,20 +130,18 @@ def test_attach_cartons_sets_only_matching_serials():
     assert by_serial[3].cartons.parsed == 11
 
 
-def test_attach_cartons_records_the_merged_group_span():
-    """A shared carton cell's row span rides on the group's first line."""
+def test_attach_cartons_records_the_serials_sharing_one_carton_cell():
     orch = ConversionOrchestrator(
         invoice_parser=_StubInvoiceParser(
-            cartons={1: _num(1)}, cartons_spans={1: 2}
+            cartons={1: _num(1)}, carton_groups={1: (1, 2)}
         )
     )
     enriched = orch._attach_cartons(_extracted(3), b"%PDF-fake")
     by_serial = {li.item_serial: li for li in enriched.line_items}
     assert by_serial[1].cartons.parsed == 1
-    assert by_serial[1].cartons_span == 2
-    # The other lines keep the ordinary unmerged span.
-    assert by_serial[2].cartons_span == 1
-    assert by_serial[3].cartons_span == 1
+    assert by_serial[1].carton_group == (1, 2)
+    assert not by_serial[2].carton_group
+    assert not by_serial[3].carton_group
 
 
 def test_attach_cartons_is_non_fatal_on_parse_error():
@@ -399,7 +397,7 @@ def test_merged_carton_group_writes_once_and_merges_cells():
     carton once (live INV 916 items 20/21)."""
     from dataclasses import replace
 
-    items = [replace(_line(1), cartons=_num(1), cartons_span=2), _line(2)]
+    items = [replace(_line(1), cartons=_num(1), carton_group=(1, 2)), _line(2)]
     doc = ComputedDocument(
         header=_header(),
         lines=[ComputedLine(source=item) for item in items],
@@ -416,7 +414,7 @@ def test_four_row_merged_carton_group_spans_its_rows():
     four rows with the count written once."""
     from dataclasses import replace
 
-    items = [replace(_line(1), cartons=_num(3), cartons_span=4)]
+    items = [replace(_line(1), cartons=_num(3), carton_group=(1, 2, 3, 4))]
     items += [_line(serial) for serial in (2, 3, 4)]
     doc = ComputedDocument(
         header=_header(),
@@ -428,6 +426,21 @@ def test_four_row_merged_carton_group_spans_its_rows():
     assert ws.cell(row=13, column=COL_CTN).value == 3
     assert ws.cell(row=_totals_row_for(4), column=COL_CTN).value == 3
 
+
+def test_missing_boe_group_member_does_not_erase_next_items_cartons():
+    from dataclasses import replace
+
+    items = [
+        replace(_line(1), cartons=_num(3), carton_group=(1, 2)),
+        replace(_line(3), cartons=_num(7)),
+    ]
+    doc = ComputedDocument(
+        header=_header(), lines=[ComputedLine(source=item) for item in items],
+        totals=Totals(package_count=_num(10)),
+    )
+    ws = ExcelGenerator(use_formulas=False).build_workbook(doc, ReviewFlagSet())["Sheet1"]
+    assert "G13:G14" not in {str(rng) for rng in ws.merged_cells.ranges}
+    assert (ws["G13"].value, ws["G14"].value, ws["G17"].value) == (3, 7, 10)
 
 
 def _doc_with_cartons(cartons, package=908):

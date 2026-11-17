@@ -337,7 +337,7 @@ class ValueCalculator:
                 and not math.isclose(
                     derived,
                     sws_amount_extracted,
-                    rel_tol=1e-9,
+                    rel_tol=0,
                     abs_tol=_printed_amount_tolerance(getattr(item, "sws_amount", None))
                     + 1e-6,
                 )

@@ -374,6 +374,21 @@ def test_blank_value_cells_yield_none():
     assert _val(d, "amount") is None
 
 
+def test_value_headers_below_carton_header_read_each_number_only_once():
+    words = [
+        W("SR", 30, 40, 100), W("DESCRIPTION", 100, 170, 100),
+        W("CTNS", 328, 352, 100), W("QTY", 390, 410, 108),
+        W("PRICE", 419, 437, 108), W("AMOUNT", 465, 500, 108),
+        W("1", 30, 38, 125), W("WIRE", 100, 140, 125),
+        W("3", 335, 345, 125), W("100", 405, 421, 125),
+        W("PCS", 440, 458, 125), W("80.00", 465, 500, 125),
+    ]
+    detail = _details(words)[1]
+    assert _val(detail, "quantity") == 100
+    assert _val(detail, "unit_price") is None
+    assert _val(detail, "amount") == 80
+
+
 class _TableRow:
     def __init__(self, cells, bbox):
         self.cells = cells
@@ -397,7 +412,7 @@ class _TablePage:
         return [self._table]
 
 
-def test_merged_ctns_cell_is_read_once_and_records_its_span():
+def test_merged_ctns_cell_reassigns_a_centered_count_to_the_first_serial():
     """The invoice merges one CTNS cell over two line rows (live INV 916 items
     20/21): the value belongs to the first line and records a 2-row span, so the
     Excel writer can merge the CTN cells instead of double-counting."""
@@ -429,12 +444,12 @@ def test_merged_ctns_cell_is_read_once_and_records_its_span():
     details = {
         1: {"cartons": None, "description": None},
         2: {"cartons": None, "description": None},
-        3: {"cartons": None, "description": None},
+        3: {"cartons": parser._carton_value("1"), "description": None},
     }
     parser._fill_merged_cartons(_TablePage(_Table(data, rows)), details)
 
     assert details[1]["cartons"].parsed == 5
-    assert details[1].get("cartons_span", 1) == 1
+    assert not details[1].get("carton_group")
     assert details[2]["cartons"].parsed == 1
-    assert details[2]["cartons_span"] == 2
+    assert details[2]["carton_group"] == (2, 3)
     assert details[3]["cartons"] is None

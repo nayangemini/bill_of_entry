@@ -255,7 +255,10 @@ class InvoicePackingListParser:
                 text = page.extract_text() or ""
                 if not self._is_invoice_page(text):
                     continue
-                self._parse_page(page, details)
+                page_details: dict[int, dict] = {}
+                self._parse_page(page, page_details)
+                for serial, detail in page_details.items():
+                    details.setdefault(serial, detail)
             return details
         finally:
             if should_close and handle is not None:
@@ -402,7 +405,9 @@ class InvoicePackingListParser:
                 grew = True
         return span[0], span[1]
 
-    def _column_value(self, gate: list[dict], center: float) -> RawValue | None:
+    def _column_value(
+        self, gate: list[dict], center: float, other_centers: list[float]
+    ) -> RawValue | None:
         """The money value under a value-column centre, else ``None``.
 
         The nearest in-band numeric run wins (digit-split tokens are joined
@@ -413,11 +418,19 @@ class InvoicePackingListParser:
         nearby = [
             w for w in gate
             if center - _VALUE_BAND <= self._center(w) <= center + _VALUE_BAND
+            and all(
+                abs(self._center(w) - center) < abs(self._center(w) - other)
+                for other in other_centers
+            )
             and self._is_money(w["text"])
         ]
         if not nearby:
             return None
-        return self._money_value(self._join_number_tokens(nearby))
+        groups = self._number_token_groups(nearby)
+        nearest = min(
+            groups, key=lambda group: abs((group[0]["x0"] + group[-1]["x1"]) / 2 - center)
+        )
+        return self._money_value("".join(w["text"].strip() for w in nearest))
 
     def _parse_page(self, page, details: dict[int, dict]) -> None:
         rows = self._rows(page)
@@ -429,10 +442,18 @@ class InvoicePackingListParser:
         # Suppliers often print the column header across several geometric rows
         # (a "TOTAL QTY" split over two lines, "UNIT PRICE" / "TOTAL AMOUNT"
         # beside the carton label). Search the header block - the header row and
-        # the few rows above it - not just the carton-label row, so every value
+        # nearby rows on either side - not just the carton-label row, so every value
         # column is located even when its label sits on a neighbouring line.
         block_start = max(0, header_index - _VALUE_HEADER_ROWS)
-        header_block = [w for row in rows[block_start:header_index + 1] for w in row]
+        block_end = header_index + 1
+        for row in rows[block_end:block_end + _VALUE_HEADER_ROWS]:
+            if _row_has_sr(row):
+                break
+            block_end += 1
+        header_block = [
+            w for index in sorted(range(block_start, block_end), key=lambda i: abs(i - header_index))
+            for w in rows[index] if self._center(w) > ctns_center
+        ]
         value_centers = self._value_columns(header_block)
         lo, hi = ctns_center - _CTNS_BAND, ctns_center + _CTNS_BAND
         # The description column sits between the SR NO column and the CTNS band.
@@ -491,7 +512,10 @@ class InvoicePackingListParser:
             # value is never fabricated, and without both sides numeric the
             # orchestrator simply skips that field's comparison.
             for field, center in value_centers.items():
-                entry[field] = self._column_value(gate, center)
+                other_centers = [ctns_center] + [
+                    x for key, x in value_centers.items() if key != field
+                ]
+                entry[field] = self._column_value(gate, center, other_centers)
 
             # Description: all tokens between the SR NO column and the CTNS band,
             # left-to-right (e.g. "SLIDERS (GARMENT ACCESSORY)"). Original
@@ -519,10 +543,11 @@ class InvoicePackingListParser:
         extraction puts that number on a baseline of its own, so the positional
         row parser leaves every row blank. When the page exposes grid tables,
         read the CTNS column's cell spans and put the value on the group's first
-        row, recording ``cartons_span`` so the Excel writer can merge the CTN
+        row, recording ``carton_group`` so the Excel writer can merge the CTN
         cells over the same rows. The invoice counts a shared group once, so
         repeating the value on every row would overstate the carton total.
-        Values already read positionally are never overwritten.
+        A verified shared cell takes precedence over positional values; its
+        centered number can be mistaken for an independent count on a lower row.
         """
         find_tables = getattr(page, "find_tables", None)
         if find_tables is None:
@@ -550,11 +575,11 @@ class InvoicePackingListParser:
             for table_row, cells in zip(rows, data):
                 serial = self._table_serial(cells)
                 bbox = getattr(table_row, "bbox", None)
-                if serial is None or serial not in details or bbox is None:
+                if serial is None or bbox is None:
                     continue
                 serial_rows.append((serial, float(bbox[1])))
             for table_row, cells in zip(rows, data):
-                if len(cells) <= ctns_index:
+                if len(cells) <= ctns_index or len(table_row.cells) <= ctns_index:
                     continue
                 text = cells[ctns_index]
                 cell = table_row.cells[ctns_index]
@@ -569,14 +594,18 @@ class InvoicePackingListParser:
                 if not covered:
                     continue
                 first_serial = covered[0]
+                if self._table_serial(cells) != first_serial or first_serial not in details:
+                    continue
                 value = self._carton_value(str(text))
-                if details[first_serial]["cartons"] is None:
-                    details[first_serial]["cartons"] = value
                 # The invoice merges one CTNS cell over a shared carton group.
-                # Record its row span on the group's first line so the Excel
-                # writer mirrors the merge (and the CTN total counts it once).
                 if len(covered) > 1:
-                    details[first_serial]["cartons_span"] = len(covered)
+                    details[first_serial]["cartons"] = value
+                    details[first_serial]["carton_group"] = tuple(covered)
+                    for serial in covered[1:]:
+                        if serial in details:
+                            details[serial]["cartons"] = None
+                elif details[first_serial]["cartons"] is None:
+                    details[first_serial]["cartons"] = value
 
     @staticmethod
     def _ctns_column_index(data: list[list]) -> int | None:
@@ -628,7 +657,12 @@ class InvoicePackingListParser:
         ``_DIGIT_JOIN_GAP``. The first group wins: a row carries a single
         carton value, so extra far-apart groups are stray marks, not data.
         """
-        ranked = sorted(words, key=_xcenter)
+        first = InvoicePackingListParser._number_token_groups(words)[0]
+        return "".join(w["text"].strip() for w in first)
+
+    @staticmethod
+    def _number_token_groups(words: list[dict]) -> list[list[dict]]:
+        ranked = sorted(words, key=lambda w: float(w["x0"]))
         groups: list[list[dict]] = [[ranked[0]]]
         for w in ranked[1:]:
             prev = groups[-1][-1]
@@ -636,7 +670,7 @@ class InvoicePackingListParser:
                 groups[-1].append(w)
             else:
                 groups.append([w])
-        return "".join(w["text"].strip() for w in groups[0])
+        return groups
 
     @staticmethod
     def _carton_value(text: str) -> RawValue:

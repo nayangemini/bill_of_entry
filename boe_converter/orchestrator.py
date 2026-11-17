@@ -312,7 +312,7 @@ class ConversionOrchestrator:
         ``DESCRIPTION OF GOODS`` (Excel column ``E`` / the stock name), which the
         user prefers over the terser BOE description when an invoice is supplied.
         When the invoice merges a CTNS cell over several lines (a shared carton
-        group), the group's first line carries the count plus its ``cartons_span``
+        group), the group's first line carries the count plus its ``carton_group``
         so the Excel writer merges column G over the same rows and the total
         counts the group once.
         Lines absent from the invoice keep their BOE values. Any failure
@@ -347,9 +347,9 @@ class ConversionOrchestrator:
             changes = {}
             if detail.get("cartons") is not None:
                 changes["cartons"] = detail["cartons"]
-            span = detail.get("cartons_span")
-            if isinstance(span, int) and span > 1:
-                changes["cartons_span"] = span
+            group = detail.get("carton_group")
+            if group:
+                changes["carton_group"] = group
             # When the invoice provides a description for this line, it takes
             # precedence over the BOE description (Excel column E / stock name).
             if detail.get("description") is not None:
@@ -406,18 +406,18 @@ class ConversionOrchestrator:
         ):
             mismatched.append("quantity")
         inv_price = _detail_number(detail, "unit_price")
-        price_tol = _printed_precision_tolerance(detail.get("unit_price"))
         if (
             boe_price is not None
             and inv_price is not None
             and not math.isclose(
-                boe_price, inv_price, rel_tol=1e-9, abs_tol=price_tol + 1e-6
+                boe_price, inv_price, rel_tol=0,
+                abs_tol=_printed_precision_tolerance(detail["unit_price"]) + 1e-6,
             )
         ):
             mismatched.append("unit_price_usd")
         inv_amount = _detail_number(detail, "amount")
         if boe_amount is not None and inv_amount is not None and not math.isclose(
-            boe_amount, inv_amount, rel_tol=1e-9, abs_tol=0.005 + 1e-6
+            boe_amount, inv_amount, rel_tol=0, abs_tol=0.005 + 1e-6
         ):
             mismatched.append("amount_usd")
         return tuple(mismatched)
