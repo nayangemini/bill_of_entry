@@ -59,6 +59,7 @@ from boe_converter.models import (
     ReviewFlagSet,
 )
 from boe_converter.parser import PdfParser
+from boe_converter.units import tape_pcs_override
 from boe_converter.validator import UploadValidator
 
 logger = logging.getLogger(__name__)
@@ -147,6 +148,26 @@ def _detail_number(detail: dict, key: str) -> float | None:
     """
     value = detail.get(key)
     return _as_number(value) if isinstance(value, RawValue) else None
+
+
+def _printed_precision_tolerance(value: RawValue | None) -> float:
+    """Half a unit in the last decimal the invoice actually printed.
+
+    The invoice prints unit prices rounded to a fixed number of decimals
+    (``0.025`` as ``0.03``). Comparing such a printed price to the BOE's
+    full-precision value at a sub-paisa tolerance flags pure display rounding,
+    so the allowed difference is half the last printed decimal - capped at half
+    a cent, since invoice money never resolves finer than cents. A value with no
+    decimal point (an integer price) also gets the half-cent cap, so a genuine
+    price difference still flags.
+    """
+    if value is None or value.is_missing or not value.raw_text:
+        return 0.005
+    text = value.raw_text.strip().replace(",", "").lstrip("$₹€£ ").strip()
+    if "." not in text:
+        return 0.005
+    decimals = len(text.split(".", 1)[1])
+    return min(0.5 * (10.0 ** -decimals), 0.005)
 
 
 class ConversionOrchestrator:
@@ -290,6 +311,10 @@ class ConversionOrchestrator:
         column ``G``) and overrides the description with the invoice's
         ``DESCRIPTION OF GOODS`` (Excel column ``E`` / the stock name), which the
         user prefers over the terser BOE description when an invoice is supplied.
+        When the invoice merges a CTNS cell over several lines (a shared carton
+        group), the group's first line carries the count plus its ``cartons_span``
+        so the Excel writer merges column G over the same rows and the total
+        counts the group once.
         Lines absent from the invoice keep their BOE values. Any failure
         (unreadable invoice, unexpected layout) is swallowed and logged - the BOE
         conversion proceeds unchanged so an optional, malformed invoice never
@@ -322,6 +347,9 @@ class ConversionOrchestrator:
             changes = {}
             if detail.get("cartons") is not None:
                 changes["cartons"] = detail["cartons"]
+            span = detail.get("cartons_span")
+            if isinstance(span, int) and span > 1:
+                changes["cartons_span"] = span
             # When the invoice provides a description for this line, it takes
             # precedence over the BOE description (Excel column E / stock name).
             if detail.get("description") is not None:
@@ -340,12 +368,18 @@ class ConversionOrchestrator:
 
         Compares quantity, unit price, and amount (the BOE amount is
         ``unit_price x quantity`` recomputed here; the BOE prints no per-line
-        amount field). Quantity and unit price count only when both sides are
-        numeric and differ beyond float dust (``math.isclose`` with a sub-paisa
-        absolute tolerance). Amount is compared rounded to cents: the invoice
-        prints amounts to 2 decimals, so a half-cent rounding difference
-        (e.g. ``8333.5 x 0.15 = 1250.025`` printed as ``1250.03``) is not a
-        mismatch - only a difference beyond half a cent plus dust flags.
+        amount field). A field only counts when both sides are numeric:
+
+        - **Quantity** is strict (sub-unit dust only) and skipped for a weighed
+          tape line, where the BOE books the weight while the invoice counts
+          pieces (``tape_pcs_override``); those quantities legitimately differ.
+        - **Unit price** allows half a unit in the last decimal the invoice
+          printed, capped at half a cent (``_printed_precision_tolerance``):
+          an invoice printing ``0.025`` as ``0.03`` is display rounding, not a
+          value difference.
+        - **Amount** allows half a cent for the same reason (``8333.5 x 0.15 =
+          1250.025`` printed as ``1250.03``).
+
         Returns ``()`` when nothing differs.
         """
         boe_qty = _as_number(item.quantity)
@@ -357,17 +391,28 @@ class ConversionOrchestrator:
         )
         mismatched: list[str] = []
         inv_qty = _detail_number(detail, "quantity")
+        weighed_tape = (
+            tape_pcs_override(
+                getattr(item.description, "parsed", None),
+                getattr(item.unit, "parsed", None),
+            )
+            is not None
+        )
         if (
-            boe_qty is not None
+            not weighed_tape
+            and boe_qty is not None
             and inv_qty is not None
             and not math.isclose(boe_qty, inv_qty, rel_tol=1e-9, abs_tol=1e-6)
         ):
             mismatched.append("quantity")
         inv_price = _detail_number(detail, "unit_price")
+        price_tol = _printed_precision_tolerance(detail.get("unit_price"))
         if (
             boe_price is not None
             and inv_price is not None
-            and not math.isclose(boe_price, inv_price, rel_tol=1e-9, abs_tol=1e-6)
+            and not math.isclose(
+                boe_price, inv_price, rel_tol=1e-9, abs_tol=price_tol + 1e-6
+            )
         ):
             mismatched.append("unit_price_usd")
         inv_amount = _detail_number(detail, "amount")

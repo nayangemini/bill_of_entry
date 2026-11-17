@@ -23,6 +23,8 @@ These tests assert:
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from boe_converter.excel_writer import (
     COL_AMOUNT,
     COL_GST,
@@ -137,6 +139,27 @@ def test_igst_column_q_is_literal_not_formula():
     q = ws.cell(row=13, column=COL_GST).value
     assert not (isinstance(q, str) and q.startswith("="))
     assert q == computed.lines[0].igst_amount
+
+
+def test_declared_sws_below_rate_times_base_writes_the_printed_amount():
+    """BE 5083334 item 15: NCCD sits in U but is not surcharged, so the printed
+    SWS (486.2, 10% of BCD only) must be a literal, not ``=U*V`` (2495.23).
+    Q uses the smaller SWS, keeping the IGST total aligned with the BE."""
+    item = replace(
+        _item(1, igst_rate=0.05),
+        assessable_value=_num(24310.67),
+        bcd_amount=_num(4862.1),
+        other_duties_total=_num(24952.3),  # BCD + NCCD
+        sws_rate=_num(0.1),
+        sws_amount=RawValue(raw_text="486.2", parsed=486.2),
+    )
+    ws, computed = _build([item])
+    r = 13
+
+    assert ws.cell(row=r, column=COL_SURCHARGE).value == 486.2
+    assert ws.cell(row=r, column=COL_GST).value == computed.lines[0].igst_amount
+    expected_igst = 0.05 * (24310.67 + 24952.3 + 486.2)
+    assert abs(computed.lines[0].igst_amount - expected_igst) < 1e-9
 
 
 def test_rate_cells_format_whole_and_fractional_percentages():

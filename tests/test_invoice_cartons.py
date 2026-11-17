@@ -87,17 +87,19 @@ def test_lineitem_cartons_defaults_to_missing():
 # ---------------------------------------------------------------------------
 class _StubInvoiceParser:
     def __init__(self, cartons=None, descriptions=None, unit_prices=None,
-                 quantities=None, amounts=None):
+                 quantities=None, amounts=None, cartons_spans=None):
         self._cartons = dict(cartons or {})
         self._descriptions = dict(descriptions or {})
         self._unit_prices = dict(unit_prices or {})
         self._quantities = dict(quantities or {})
         self._amounts = dict(amounts or {})
+        self._cartons_spans = dict(cartons_spans or {})
 
     def parse_line_details(self, doc):  # noqa: ANN001
         serials = (
             set(self._cartons) | set(self._descriptions) | set(self._unit_prices)
             | set(self._quantities) | set(self._amounts)
+            | set(self._cartons_spans)
         )
         return {
             s: {
@@ -106,6 +108,7 @@ class _StubInvoiceParser:
                 "unit_price": self._unit_prices.get(s),
                 "quantity": self._quantities.get(s),
                 "amount": self._amounts.get(s),
+                "cartons_span": self._cartons_spans.get(s),
             }
             for s in serials
         }
@@ -125,6 +128,22 @@ def test_attach_cartons_sets_only_matching_serials():
     assert by_serial[1].cartons.parsed == 131
     assert by_serial[2].cartons.is_missing is True  # absent from invoice
     assert by_serial[3].cartons.parsed == 11
+
+
+def test_attach_cartons_records_the_merged_group_span():
+    """A shared carton cell's row span rides on the group's first line."""
+    orch = ConversionOrchestrator(
+        invoice_parser=_StubInvoiceParser(
+            cartons={1: _num(1)}, cartons_spans={1: 2}
+        )
+    )
+    enriched = orch._attach_cartons(_extracted(3), b"%PDF-fake")
+    by_serial = {li.item_serial: li for li in enriched.line_items}
+    assert by_serial[1].cartons.parsed == 1
+    assert by_serial[1].cartons_span == 2
+    # The other lines keep the ordinary unmerged span.
+    assert by_serial[2].cartons_span == 1
+    assert by_serial[3].cartons_span == 1
 
 
 def test_attach_cartons_is_non_fatal_on_parse_error():
@@ -287,6 +306,67 @@ def test_genuine_one_cent_amount_difference_is_flagged():
     assert enriched.line_items[0].invoice_mismatch == ("amount_usd",)
 
 
+def test_printed_unit_price_rounding_is_not_flagged():
+    """0.025 prints as 0.03 on the invoice; that is display rounding, not a
+    value difference (live INV 916 row 5 false alarm)."""
+    base = _mline(1, 3000.0, 0.025)
+    doc = ExtractedDocument(
+        header=_header(), line_items=[base], declared_item_count=1
+    )
+    orch = ConversionOrchestrator(
+        invoice_parser=_StubInvoiceParser(
+            quantities={1: _num(3000.0)},
+            unit_prices={1: _num(0.03)},
+            amounts={1: _num(75.0)},
+        )
+    )
+    enriched = orch._attach_cartons(doc, b"%PDF-fake")
+    assert enriched.line_items[0].invoice_mismatch == ()
+
+
+def test_genuine_price_difference_beyond_printed_precision_is_flagged():
+    """A real price difference is far wider than the invoice's half-cent
+    printing step, so it still turns the row red."""
+    base = _mline(1, 10.0, 0.20)
+    doc = ExtractedDocument(
+        header=_header(), line_items=[base], declared_item_count=1
+    )
+    orch = ConversionOrchestrator(
+        invoice_parser=_StubInvoiceParser(
+            quantities={1: _num(10.0)},
+            unit_prices={1: _num(0.10)},
+            amounts={1: _num(1.0)},
+        )
+    )
+    enriched = orch._attach_cartons(doc, b"%PDF-fake")
+    assert enriched.line_items[0].invoice_mismatch == (
+        "unit_price_usd",
+        "amount_usd",
+    )
+
+
+def test_weighed_tape_quantity_difference_is_not_flagged():
+    """The BOE books tape by weight while the invoice counts pieces; that
+    quantity difference is expected, not a mismatch."""
+    from dataclasses import replace
+
+    base = replace(
+        _mline(1, 5.0, 10.0),
+        description=RawValue(
+            raw_text="WHITE TAPE (1000PC)", parsed="WHITE TAPE (1000PC)"
+        ),
+        unit=RawValue(raw_text="KGS", parsed="KGS"),
+    )
+    doc = ExtractedDocument(
+        header=_header(), line_items=[base], declared_item_count=1
+    )
+    orch = ConversionOrchestrator(
+        invoice_parser=_StubInvoiceParser(quantities={1: _num(1000.0)})
+    )
+    enriched = orch._attach_cartons(doc, b"%PDF-fake")
+    assert enriched.line_items[0].invoice_mismatch == ()
+
+
 # ---------------------------------------------------------------------------
 # Excel writer: per-line CTN cell (column G)
 # ---------------------------------------------------------------------------
@@ -311,6 +391,43 @@ def test_excel_leaves_cartons_blank_when_missing():
     )
     ws = ExcelGenerator(use_formulas=False).build_workbook(doc, ReviewFlagSet())["Sheet1"]
     assert ws.cell(row=13, column=COL_CTN).value is None
+
+
+def test_merged_carton_group_writes_once_and_merges_cells():
+    """A shared carton group (invoice merges 1 CTNS cell over 2 lines) writes
+    the count once and merges the two Excel CTN cells, so the total counts the
+    carton once (live INV 916 items 20/21)."""
+    from dataclasses import replace
+
+    items = [replace(_line(1), cartons=_num(1), cartons_span=2), _line(2)]
+    doc = ComputedDocument(
+        header=_header(),
+        lines=[ComputedLine(source=item) for item in items],
+        totals=Totals(package_count=_num(908)),
+    )
+    ws = ExcelGenerator(use_formulas=False).build_workbook(doc, ReviewFlagSet())["Sheet1"]
+    assert "G13:G14" in {str(rng) for rng in ws.merged_cells.ranges}
+    assert ws.cell(row=13, column=COL_CTN).value == 1
+    assert ws.cell(row=_totals_row_for(2), column=COL_CTN).value == 1
+
+
+def test_four_row_merged_carton_group_spans_its_rows():
+    """Four lines sharing 3 cartons (live INV 916 items 23-26) merge G across
+    four rows with the count written once."""
+    from dataclasses import replace
+
+    items = [replace(_line(1), cartons=_num(3), cartons_span=4)]
+    items += [_line(serial) for serial in (2, 3, 4)]
+    doc = ComputedDocument(
+        header=_header(),
+        lines=[ComputedLine(source=item) for item in items],
+        totals=Totals(package_count=_num(908)),
+    )
+    ws = ExcelGenerator(use_formulas=False).build_workbook(doc, ReviewFlagSet())["Sheet1"]
+    assert "G13:G16" in {str(rng) for rng in ws.merged_cells.ranges}
+    assert ws.cell(row=13, column=COL_CTN).value == 3
+    assert ws.cell(row=_totals_row_for(4), column=COL_CTN).value == 3
+
 
 
 def _doc_with_cartons(cartons, package=908):

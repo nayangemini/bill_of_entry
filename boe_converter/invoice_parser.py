@@ -68,6 +68,22 @@ _VALUE_TOKENS = {"QTY": "quantity", "PRICE": "unit_price", "AMOUNT": "amount"}
 # no numerics (fused ``4000THD`` splits are centred on it, outside every band).
 _VALUE_BAND = 20.0
 
+# How many geometric rows above the carton-label row belong to the same header
+# block. Suppliers split the column header across two or three lines (e.g.
+# "TOTAL" on one row and "QTY" on the next, or "DESCRIPTION OF GOODS" stacked
+# over three), so the value-column labels are searched within this small band
+# rather than on the carton-label row alone.
+_VALUE_HEADER_ROWS = 3
+
+# Max horizontal gap (points) between words forming one column label, and max
+# vertical offset for them to count as the same header line. Suppliers print
+# "TOTAL QTY" / "TOTAL AMOUNT" as two adjacent words whose numbers sit under the
+# combined span, not under the single word naming the value; without joining
+# them the QTY band can miss every quantity when the label's narrower word is
+# right-aligned.
+_LABEL_JOIN_GAP = 10.0
+_LABEL_ROW_TOL = 1.0
+
 # Words marking a totals/footer row: never absorb such a row while stitching,
 # so a footer ("TOTAL CTN : 1159") cannot donate its number to a serial above.
 _NON_DATA_HINTS = {"TOTAL", "SUBTOTAL", "GRAND", "BALANCE"}
@@ -339,18 +355,52 @@ class InvoicePackingListParser:
     def _value_columns(self, header_row: list[dict]) -> dict[str, float]:
         """Map detail key -> column centre for the invoice value columns.
 
-        Looks for the ``QTY`` / ``PRICE`` / ``AMOUNT`` header words in the same
-        header row that carries the carton header (suppliers print ``TOTAL
-        QTY``, ``UNIT PRICE``, ``TOTAL AMOUNT``). A column whose header word is
-        absent simply yields no values - the caller then leaves that field
-        blank rather than guessing from a neighbouring column.
+        Looks for the ``QTY`` / ``PRICE`` / ``AMOUNT`` header words in the
+        header block (the carton-label row plus the rows above it, where
+        suppliers print ``TOTAL QTY``, ``UNIT PRICE``, ``TOTAL AMOUNT``). A
+        column whose header word is absent simply yields no values - the caller
+        then leaves that field blank rather than guessing from a neighbouring
+        column.
         """
         centers: dict[str, float] = {}
         for w in header_row:
             key = _VALUE_TOKENS.get(w["text"].strip().upper().strip(".,:;"))
             if key is not None and key not in centers:
-                centers[key] = self._center(w)
+                x0, x1 = self._label_span(w, header_row)
+                centers[key] = (x0 + x1) / 2.0
         return centers
+
+    def _label_span(self, word: dict, header_words: list[dict]) -> tuple[float, float]:
+        """Horizontal span of the full column label containing ``word``.
+
+        Suppliers print a value column's label as adjacent words on one line
+        (``TOTAL QTY``, ``UNIT PRICE``, ``TOTAL AMOUNT``); the numbers sit under
+        the whole label, not under the single word that names the value. Merge
+        the words immediately to its left - never to the right - so a
+        right-aligned ``QTY`` still centres over its numbers without absorbing
+        the next column's ``UNIT`` label.
+        """
+        span = [word["x0"], word["x1"]]
+        merged: set[int] = {id(word)}
+        grew = True
+        while grew:
+            grew = False
+            for other in header_words:
+                if id(other) in merged or not other["text"].strip().isalpha():
+                    continue
+                if other["text"].strip().upper().strip(".,:;") in _VALUE_TOKENS:
+                    continue  # never absorb a neighbouring value column's word
+                if abs(other["top"] - word["top"]) > _LABEL_ROW_TOL:
+                    continue
+                if other["x0"] >= span[0]:
+                    continue  # only words starting left of the label join it
+                if other["x1"] < span[0] - _LABEL_JOIN_GAP:
+                    continue
+                span[0] = min(span[0], other["x0"])
+                span[1] = max(span[1], other["x1"])
+                merged.add(id(other))
+                grew = True
+        return span[0], span[1]
 
     def _column_value(self, gate: list[dict], center: float) -> RawValue | None:
         """The money value under a value-column centre, else ``None``.
@@ -376,7 +426,14 @@ class InvoicePackingListParser:
         if header is None:
             return
         header_index, ctns_center = header
-        value_centers = self._value_columns(rows[header_index])
+        # Suppliers often print the column header across several geometric rows
+        # (a "TOTAL QTY" split over two lines, "UNIT PRICE" / "TOTAL AMOUNT"
+        # beside the carton label). Search the header block - the header row and
+        # the few rows above it - not just the carton-label row, so every value
+        # column is located even when its label sits on a neighbouring line.
+        block_start = max(0, header_index - _VALUE_HEADER_ROWS)
+        header_block = [w for row in rows[block_start:header_index + 1] for w in row]
+        value_centers = self._value_columns(header_block)
         lo, hi = ctns_center - _CTNS_BAND, ctns_center + _CTNS_BAND
         # The description column sits between the SR NO column and the CTNS band.
         desc_hi = ctns_center - _CTNS_BAND
@@ -447,6 +504,99 @@ class InvoicePackingListParser:
             desc = " ".join(w["text"].strip() for w in desc_words).strip()
             if desc:
                 entry["description"] = RawValue(raw_text=desc, parsed=desc)
+
+        # Some suppliers merge the TOTAL CTNS cell across several line rows and
+        # centre the count vertically; those lower rows have no carton word on
+        # their baseline. Recover such values from the table's merged cells.
+        if any(d["cartons"] is None for d in details.values()):
+            self._fill_merged_cartons(page, details)
+
+    def _fill_merged_cartons(self, page, details: dict[int, dict]) -> None:
+        """Recover a vertically merged CTNS cell and its row span.
+
+        A supplier merges the carton cell across several line rows and centres
+        the number (two rows sharing ``1``, four rows sharing ``3``). Word
+        extraction puts that number on a baseline of its own, so the positional
+        row parser leaves every row blank. When the page exposes grid tables,
+        read the CTNS column's cell spans and put the value on the group's first
+        row, recording ``cartons_span`` so the Excel writer can merge the CTN
+        cells over the same rows. The invoice counts a shared group once, so
+        repeating the value on every row would overstate the carton total.
+        Values already read positionally are never overwritten.
+        """
+        find_tables = getattr(page, "find_tables", None)
+        if find_tables is None:
+            return
+        try:
+            tables = find_tables()
+        except Exception:
+            return
+        for table in tables:
+            try:
+                data = table.extract()
+                rows = list(getattr(table, "rows", None) or [])
+            except Exception:
+                continue
+            if not data:
+                continue
+            ctns_index = self._ctns_column_index(data)
+            if ctns_index is None:
+                continue
+            # Map table rows to already-parsed invoice serials, in table order.
+            # The row's top edge (not its centre) identifies which merged cell
+            # covers it: pdfplumber extends the first row's bbox over the whole
+            # merged span, so a centre test would reorder the group's rows.
+            serial_rows: list[tuple[int, float]] = []
+            for table_row, cells in zip(rows, data):
+                serial = self._table_serial(cells)
+                bbox = getattr(table_row, "bbox", None)
+                if serial is None or serial not in details or bbox is None:
+                    continue
+                serial_rows.append((serial, float(bbox[1])))
+            for table_row, cells in zip(rows, data):
+                if len(cells) <= ctns_index:
+                    continue
+                text = cells[ctns_index]
+                cell = table_row.cells[ctns_index]
+                if cell is None or not text or not self._is_number(str(text)):
+                    continue
+                top, bottom = float(cell[1]), float(cell[3])
+                covered = [
+                    serial
+                    for serial, row_top in serial_rows
+                    if top - 0.5 <= row_top < bottom
+                ]
+                if not covered:
+                    continue
+                first_serial = covered[0]
+                value = self._carton_value(str(text))
+                if details[first_serial]["cartons"] is None:
+                    details[first_serial]["cartons"] = value
+                # The invoice merges one CTNS cell over a shared carton group.
+                # Record its row span on the group's first line so the Excel
+                # writer mirrors the merge (and the CTN total counts it once).
+                if len(covered) > 1:
+                    details[first_serial]["cartons_span"] = len(covered)
+
+    @staticmethod
+    def _ctns_column_index(data: list[list]) -> int | None:
+        """Index of the CTNS column in a table's header row, else ``None``."""
+        for row in data[:2]:
+            for index, cell in enumerate(row):
+                if cell and "CTN" in str(cell).upper():
+                    return index
+        return None
+
+    @staticmethod
+    def _table_serial(cells: list) -> int | None:
+        """The SR NO in a table row's leading cells, else ``None``."""
+        for cell in cells[:2]:
+            if not cell:
+                continue
+            text = str(cell).strip().rstrip(".").strip()
+            if text.isdigit() and 1 <= int(text) <= 999:
+                return int(text)
+        return None
 
     @staticmethod
     def _is_number(text: str) -> bool:

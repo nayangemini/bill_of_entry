@@ -644,6 +644,31 @@ class ExcelGenerator:
             row = ITEM_TABLE_FIRST_DATA_ROW + offset
             self._write_item_row(ws, row, offset + 1, line, usd_rate, flags)
 
+        # Mirror the invoice's merged CTNS cells: a shared carton group writes
+        # its count once and spans the same line rows in column G. The totals
+        # SUM then counts the group once (924/916-style totals stay right)
+        # instead of multiplying the count by the number of shared lines.
+        last_item_row = ITEM_TABLE_FIRST_DATA_ROW + len(ordered) - 1
+        for offset, line in enumerate(ordered):
+            span = line.source.cartons_span
+            if span <= 1 or _raw_number(line.source.cartons) is None:
+                continue
+            first_row = ITEM_TABLE_FIRST_DATA_ROW + offset
+            last_row = min(first_row + span - 1, last_item_row)
+            if last_row > first_row:
+                ws.merge_cells(
+                    start_row=first_row,
+                    start_column=COL_CTN,
+                    end_row=last_row,
+                    end_column=COL_CTN,
+                )
+                # A merged cell only shows the top-left style. If any line in
+                # the shared group differs from the invoice, red-fill the whole
+                # merged CTN cell so the alert is not hidden by the merge.
+                group = ordered[offset : offset + (last_row - first_row + 1)]
+                if any(ln.source.invoice_mismatch for ln in group):
+                    ws.cell(row=first_row, column=COL_CTN).fill = INVOICE_MISMATCH_FILL
+
     def _write_item_row(
         self,
         ws: Worksheet,
@@ -739,7 +764,25 @@ class ExcelGenerator:
         self._put_computed(
             ws, row, COL_RATE_PER_USD, line.purchase_inr, f"=L{row}*{self._num(usd_rate)}"
         )
-        self._put_computed(ws, row, COL_SURCHARGE, line.sws_amount, f"=U{row}*V{row}")
+        # SWS is normally the live =U*V formula. But the BOE may surcharge only
+        # part of the CUST AIDC base (NCCD is not subject to SWS), so its printed
+        # amount can be well below rate*U. The calculator then keeps the printed
+        # amount; write it literally so Excel does not recompute the inflated
+        # rate*U and propagate the error into P/S/X and the totals row.
+        sws_rate_for_formula = (
+            sws_rate_val if sws_rate_val is not None else SWS_RATE
+        )
+        sws_matches_rate = (
+            line.cust_aidc is not None
+            and line.sws_amount is not None
+            and abs(line.cust_aidc * sws_rate_for_formula - line.sws_amount) <= 0.01
+        )
+        if sws_matches_rate:
+            self._put_computed(
+                ws, row, COL_SURCHARGE, line.sws_amount, f"=U{row}*V{row}"
+            )
+        else:
+            self._set_cell(ws, row, COL_SURCHARGE, line.sws_amount)
         self._put_computed(
             ws, row, COL_TOTAL_CUSTOM_DUTY, line.total_customs_duty, f"=U{row}+W{row}"
         )

@@ -123,6 +123,13 @@ class LineItem:
     # itself; optionally supplied from the supplier invoice and joined on
     # ``item_serial`` (defaults to missing -> the CTN cell stays blank).
     cartons: RawValue = field(default_factory=RawValue.missing)
+    # Number of consecutive line rows whose CTN cells form one merged cell in
+    # the invoice (a shared carton group: e.g. two items packed in one carton).
+    # ``1`` means an ordinary unmerged cell. When >1, ``cartons`` belongs to
+    # this first line of the group and the Excel writer merges column G over
+    # this many item rows, so the CTN total counts the group once - exactly as
+    # the invoice does.
+    cartons_span: int = 1
     # BOE-vs-invoice value differences for Excel row highlighting. Set by the
     # orchestrator when a supplied invoice states a different quantity, unit
     # price or amount for this serial; empty when the invoice was absent, the
